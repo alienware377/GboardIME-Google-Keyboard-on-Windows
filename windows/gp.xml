@@ -1,0 +1,24 @@
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <boolean name="pref_key_should_reset_suggestions_pref" value="false" />
+    <string name="ACTIVE_IME.SOFT.und-Latn-x-password">password</string>
+    <long name="pref_key_first_periodic_ping" value="1782100933917" />
+    <long name="pref_key_latest_ime_activation_time" value="1782101082596" />
+    <string name="ACTIVE_IME.SOFT.en-US">ime_english_united_states</string>
+    <long name="app_last_started_version_name" value="36070236" />
+    <boolean name="import_user_contacts" value="false" />
+    <set name="previously_enabled_entries">
+        <string>en-US</string>
+    </set>
+    <float name="pref_key_keyboard_height_ratio" value="2.0" />
+    <string name="current_input_method_entry">en-US:qwerty</string>
+    <long name="pref_key_contacts_suggestion_notice_wait_start_time" value="1782100933910" />
+    <boolean name="show_suggestions" value="true" />
+    <long name="pref_key_last_ping_time" value="1782101082596" />
+    <string name="keyboard_height_ratio">2.0</string>
+    <int name="normal_mode_keyboard_bottom_gap_portrait" value="126" />
+    <boolean name="data_file_manager_initialized" value="true" />
+    <long name="latest_activation_time" value="1782101082581" />
+    <long name="search_hint_module_install_time" value="1782100933821" />
+    <boolean name="normal_mode_keyboard_qualified_to_higher_keyboard" value="true" />
+</map>

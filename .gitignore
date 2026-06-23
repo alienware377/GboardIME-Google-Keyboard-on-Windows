@@ -1,0 +1,33 @@
+# Large local AVD backup (multi-GB) — never upload
+avd_backup/
+
+# Third-party Gboard APK binaries (Google's, copyrighted) used only for local recovery
+windows/gboard97_backup.apk
+windows/gboard_old.apk
+*.apk
+!windows/GboardRelay.apk
+
+# Debug screenshots
+windows/*.png
+
+# Logs (the host log can contain text the user typed)
+windows/*.log
+*.log
+
+# Pulled Gboard preference dumps (experiment artifacts)
+windows/gbprefs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Android build artifacts
+android/**/build/
+android/**/.gradle/
+android/**/.idea/
+**/local.properties
+.gradle/
+
+# OS / editor
+Thumbs.db
+.DS_Store

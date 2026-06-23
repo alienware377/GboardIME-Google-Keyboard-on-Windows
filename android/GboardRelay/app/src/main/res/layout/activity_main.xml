@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#1A1A2E"
+    android:gravity="center_horizontal|top"
+    android:padding="6dp">
+
+    <TextView
+        android:id="@+id/title_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="⌨ Gboard → Windows Relay"
+        android:textColor="#90CAF9"
+        android:textSize="14sp"
+        android:visibility="gone"/>
+
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Connecting..."
+        android:textColor="#FF8A65"
+        android:textSize="11sp"
+        android:visibility="gone"/>
+
+    <com.gboardrelay.RelayEditText
+        android:id="@+id/input_field"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:gravity="top"
+        android:hint="Type here with Gboard — text goes to Windows"
+        android:textColor="#FFFFFF"
+        android:textColorHint="#607D8B"
+        android:textSize="14sp"
+        android:background="#263238"
+        android:padding="8dp"
+        android:inputType="textMultiLine"
+        android:imeOptions="flagNoEnterAction|flagNoFullscreen|flagNoExtractUi"/>
+
+</LinearLayout>

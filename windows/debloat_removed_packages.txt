@@ -1,0 +1,70 @@
+# GboardIME_Root AVD debloat — packages removed 2026-06-22
+# Removal method: `adb -s emulator-5554 shell pm uninstall --user 0 <pkg>`
+#   (system image untouched; data partition only). REVERSIBLE per package with:
+#   `adb -s emulator-5554 shell pm install-existing <pkg>`
+# Full AVD backup taken first at:
+#   C:\Users\djjac\Documents\GboardIME\avd_backup\GboardIME_Root_20260622_201511
+# Verified AFTER removal: Gboard renders + predicts, swipe path intact, even with GMS gone.
+
+## Batch A — user apps + their background services
+com.google.android.apps.wellbeing
+com.google.android.youtube
+com.google.android.apps.youtube.music
+com.google.android.apps.maps
+com.google.android.apps.docs
+com.google.android.apps.photos
+com.google.android.gm
+com.google.android.apps.messaging
+com.android.chrome
+com.google.android.calendar
+com.google.android.deskclock
+com.google.android.contacts
+com.google.android.dialer
+com.google.android.marvin.talkback
+com.google.android.apps.restore
+com.google.android.projection.gearhead
+com.google.android.googlequicksearchbox
+com.google.android.settings.intelligence
+com.google.android.tts
+com.google.android.partnersetup
+com.google.android.apps.customization.pixel
+com.google.android.apps.wallpaper
+com.google.android.apps.wallpaper.nexus
+com.android.egg
+com.google.android.feedback
+com.google.android.tag
+com.google.android.health.connect.backuprestore
+com.google.android.healthconnect.controller
+com.android.bookmarkprovider
+com.google.android.cellbroadcastreceiver
+com.android.stk
+
+## Batch B — background services (federated/ads/print/screensaver/etc.)
+com.google.android.federatedcompute
+com.google.android.ondevicepersonalization.services
+com.google.android.adservices.api
+com.google.mainline.adservices
+com.google.android.configupdater
+com.google.android.onetimeinitializer
+com.google.android.googlesdksetup
+com.google.android.gms.supervision
+com.google.android.printservice.recommendation
+com.android.printspooler
+com.android.bips
+com.google.android.nearby.halfsheet
+com.android.musicfx
+com.android.bluetoothmidiservice
+com.android.dreams.basic
+com.android.wallpaper.livepicker
+com.google.android.odad
+
+## Batch C — Google Play Services family + Play Store (largest background footprint)
+com.android.vending
+com.google.android.gms
+com.google.android.gsf
+
+## NOT removed (protected / kept on purpose)
+# com.google.android.devicelockcontroller  -> DELETE_FAILED_INTERNAL_ERROR (protected)
+# Kept: Gboard (inputmethod.latin), com.gboardrelay, systemui, nexuslauncher,
+#       settings, webview, permissioncontroller, all providers, networkstack,
+#       com.google.android.as / as.oss (on-device intelligence).
