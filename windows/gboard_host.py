@@ -1025,6 +1025,37 @@ def _is_editable_focus(ctrl):
         pass
     return True
 
+def _sync_key(fg, ctrl):
+    """Stable per-field identity used to decide when to push a fresh SYNC to Gboard.
+
+    Deliberately EXCLUDES geometry: a multiline input box grows as you type, so its
+    BoundingRectangle changes on every keystroke. If the SYNC trigger keyed on that,
+    every character would look like a 'new field', re-fire SYNC, and setText() would
+    wipe the half-typed buffer (the intermittent-loss bug). We key on the control's
+    durable identity instead (native handle / UIA RuntimeId / type+name)."""
+    if ctrl is None:
+        return None
+    nwh = 0
+    try:
+        nwh = ctrl.NativeWindowHandle or 0
+    except Exception:
+        pass
+    rid = None
+    try:
+        rid = tuple(ctrl.GetRuntimeId())
+    except Exception:
+        pass
+    ct = name = None
+    try:
+        ct = ctrl.ControlTypeName
+    except Exception:
+        pass
+    try:
+        name = ctrl.Name          # accessibility label/placeholder — stable per field
+    except Exception:
+        pass
+    return (fg, ct, nwh, rid, name)
+
 def _focus_sig(fg, ctrl):
     """A stable-per-field, distinct-across-fields signature of the focused control,
     used to suppress re-showing the keyboard on the same field right after the user
@@ -1061,7 +1092,7 @@ def _focus_watcher():
     last_beat     = time.time()
     suppress_sig  = None   # focus signature where physical typing hid the keyboard;
                            # don't re-raise for the SAME field until focus moves away.
-    last_field_sig = None  # sig of the last field we sent SYNC for
+    last_sync_key  = None  # stable identity of the last field we sent SYNC for
     last_cursor    = None  # (sel_start, sel_end) of last CURSOR command sent
     while True:
         # The ENTIRE body is guarded: a single uncaught exception here used to kill
@@ -1113,14 +1144,21 @@ def _focus_watcher():
                 if not shown and sig != suppress_sig:
                     show_emulator(manual=False)
                 # ── Android buffer sync ─────────────────────────────────────
-                if sig != last_field_sig:
-                    # Field changed: full text+cursor sync (background thread so
-                    # UIA reads don't block this poll loop)
-                    last_field_sig = sig
-                    last_cursor    = None
-                    threading.Thread(
-                        target=_sync_field_to_android_thread, daemon=True).start()
-                elif not typed and time.time() - _last_inject_time > 0.4:
+                skey = _sync_key(fg, ctrl)
+                since_inject = time.time() - _last_inject_time
+                if skey is not None and skey != last_sync_key:
+                    # Genuinely a DIFFERENT field. Only push a fresh SYNC once the
+                    # relay has been quiet for >1s — otherwise a field switch right
+                    # after typing (or a stray re-focus mid-glide) would setText()
+                    # over the buffer the user is still building. If the guard is
+                    # active we leave last_sync_key unchanged so it retries next tick.
+                    if since_inject > 1.0:
+                        last_sync_key = skey
+                        last_cursor   = None
+                        threading.Thread(
+                            target=_sync_field_to_android_thread, daemon=True).start()
+                elif skey is not None and skey == last_sync_key \
+                        and not typed and since_inject > 0.4:
                     # Same field: poll cursor for mouse-click repositioning.
                     # EM_GETSEL is fast enough to call inline every 250 ms.
                     try:
@@ -1134,9 +1172,10 @@ def _focus_watcher():
                 # Only auto-hide a keyboard that auto raised — never a manual one.
                 if shown and _auto_shown:
                     hide_emulator()
-                if last_field_sig is not None:
-                    last_field_sig = None
-                    last_cursor    = None
+                # NOTE: do NOT clear last_sync_key on a non-editable blip. Focus
+                # briefly bounces off the field while the keyboard shows/hides; if we
+                # reset here, returning to the SAME field would re-SYNC and wipe the
+                # buffer. The key only changes when focus lands on a truly new field.
         except Exception as e:
             log(f"[auto] watcher loop error (continuing): {e!r}")
             time.sleep(0.5)
