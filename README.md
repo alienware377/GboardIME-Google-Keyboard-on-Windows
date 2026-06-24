@@ -46,16 +46,31 @@ shortcuts.
 - Python 3 (host uses `pystray`, `pillow`, `uiautomation` — installed by `setup.ps1`)
 - A CPU with virtualization enabled (for the x86_64 emulator) and a GPU (host-GPU mode is required for smooth swipe typing)
 
-## Setup
+## Install
+
+The easiest path: **double-click `Install.cmd`** (or run `powershell -ExecutionPolicy Bypass -File install.ps1`).
+
+The installer is idempotent and does everything end-to-end:
+
+- downloads the Android SDK cmdline-tools / platform-tools / emulator if missing
+- installs the `google_apis` x86_64 API-34 system image (the rootable, non-Play-Store image)
+- creates the `GboardIME_Root` AVD and patches it to 1080x1180 @ 420dpi with host-GPU
+- installs the Python host dependencies and the prebuilt relay APK
+- cold-boots the emulator, sets Gboard as the default keyboard, sets the ADB reverse tunnel
+- provisions kiosk / Lock Task mode (Device Owner) so the keyboard can't be swiped away
+- debloats the emulator (Play Services, Assistant, stock apps) to cut background load
+- creates **Start GboardIME** / **Quit GboardIME** Start-menu shortcuts
+
+Switches:
 
 ```powershell
-# one-time
-.\setup.ps1
+.\install.ps1 -SkipDebloat   # keep all stock apps
+.\install.ps1 -SkipKiosk     # don't lock the keyboard to the foreground
+.\install.ps1 -SkipEmulator  # build/install host bits only; don't boot or provision
 ```
 
-This installs the SDK pieces, creates the AVD, installs the Python host deps, and builds the
-relay APK. Then install Gboard in the emulator and set it as the default keyboard
-(Settings → System → Languages & input → On-screen keyboard).
+Requires a Java runtime only if the prebuilt APK is missing (Android Studio bundles one). After
+install, use the Start-menu shortcuts to run it.
 
 ## Run
 

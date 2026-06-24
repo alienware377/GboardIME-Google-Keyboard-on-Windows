@@ -11,7 +11,17 @@ $EMULATOR    = "$SDK\emulator\emulator.exe"
 $AVD_NAME    = "GboardIME_Root"
 $APK         = "$ROOT\windows\GboardRelay.apk"
 $HOSTPY      = "$ROOT\windows\gboard_host.py"
-$PYTHONW     = "C:\Python314\pythonw.exe"
+# Resolve pythonw.exe portably: PATH first, then common install dirs, then a fallback.
+$PYTHONW = $null
+$cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue
+if ($cmd) { $PYTHONW = $cmd.Source }
+if (-not $PYTHONW) {
+    foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\*\pythonw.exe","C:\Python*\pythonw.exe")) {
+        $f = Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($f) { $PYTHONW = $f.FullName; break }
+    }
+}
+if (-not $PYTHONW) { $PYTHONW = "C:\Python314\pythonw.exe" }   # last-resort default
 $DEVICE_PORT = 9876   # what the relay APK connects to inside the emulator
 $HOST_PORT   = 9877   # what the Windows host listens on (9876 is taken by Blender)
 
