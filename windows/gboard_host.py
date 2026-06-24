@@ -16,6 +16,8 @@ import threading
 import time
 import os
 
+import base64
+
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
@@ -299,6 +301,7 @@ def inject_backspace(count=1):
 
 _target_hwnd: int = 0
 _target_lock  = threading.Lock()
+_last_inject_time: float = 0.0   # time of last SendInput; guards cursor-sync debounce
 
 def _is_emulator_window(hwnd: int) -> bool:
     buf = ctypes.create_unicode_buffer(512)
@@ -356,11 +359,13 @@ def _force_foreground(hwnd: int):
 
 def _inject_into_target(fn):
     """Restore focus to target window, run fn() to inject, leave focus there."""
+    global _last_inject_time
     with _target_lock:
         target = _target_hwnd
     if target:
         _force_foreground(target)
         time.sleep(0.04)   # let activation settle before SendInput
+    _last_inject_time = time.time()
     fn()
 
 # ── Command dispatcher ───────────────────────────────────────────────────────
@@ -891,6 +896,95 @@ def _titlebar_thread():
     except Exception as e:
         log(f"[titlebar] mainloop ended: {e}")
 
+# ── Android bi-directional sync (host → relay app) ───────────────────────────
+
+def send_to_android(cmd: str):
+    """Write a newline-terminated command to the connected Android relay app."""
+    with _client_lock:
+        conn = _client_conn
+    if conn is None:
+        return
+    try:
+        conn.sendall((cmd + "\n").encode("utf-8"))
+    except Exception as e:
+        log(f"[sync] send_to_android error: {e}")
+
+
+def _get_cursor_only(ctrl):
+    """Return (sel_start, sel_end) char offsets from a UIA control, or None.
+    Tries EM_GETSEL first (fast, cross-process safe for Win32 Edit controls).
+    Returns None for controls that don't expose their cursor this way."""
+    if ctrl is None:
+        return None
+    try:
+        hwnd = ctrl.NativeWindowHandle
+        if hwnd:
+            EM_GETSEL = 0x00B0
+            ret = ctypes.windll.user32.SendMessageW(
+                ctypes.c_void_p(hwnd), EM_GETSEL, 0, 0)
+            ret_u = ret & 0xFFFFFFFF          # treat as unsigned 32-bit
+            if ret_u != 0xFFFFFFFF:           # 0xFFFF_FFFF = selection too large
+                s = ret_u & 0xFFFF
+                e = (ret_u >> 16) & 0xFFFF
+                return (s, e)
+    except Exception:
+        pass
+    return None
+
+
+def _sync_field_to_android_thread():
+    """Background thread: read the focused Windows field (text + cursor) and send
+    SYNC to the Android relay app so Gboard's buffer matches the new field."""
+    ctypes.windll.ole32.CoInitialize(None)
+    try:
+        import uiautomation as auto
+        auto.SetGlobalSearchTimeout(0.5)
+        fg = ctypes.windll.user32.GetForegroundWindow()
+        if fg and _is_emulator_window(fg):
+            return
+        ctrl = auto.GetFocusedControl()
+        if ctrl is None or not _is_editable_focus(ctrl):
+            return
+
+        # 1. Read text — ValuePattern first (simple Edit), then TextPattern (rich text)
+        text = None
+        try:
+            vp = ctrl.GetValuePattern()
+            if vp is not None:
+                text = vp.Value
+        except Exception:
+            pass
+        if text is None:
+            try:
+                tp = ctrl.GetTextPattern()
+                if tp is not None:
+                    text = tp.DocumentRange.GetText(8000)
+            except Exception:
+                pass
+        if text is None:
+            text = ""
+        # Cap: Android relay trims buffer at 800 chars; send last 4000 for context
+        if len(text) > 4000:
+            text = text[-4000:]
+
+        # 2. Read cursor (fast path: EM_GETSEL; fallback: cursor at end)
+        cur = _get_cursor_only(ctrl)
+        if cur is not None:
+            sel_start = max(0, min(cur[0], len(text)))
+            sel_end   = max(0, min(cur[1], len(text)))
+        else:
+            sel_start = sel_end = len(text)   # default: cursor at end
+
+        # 3. Send
+        text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        send_to_android(f"SYNC:{text_b64}:{sel_start}:{sel_end}")
+        log(f"[sync] SYNC sent: len={len(text)} sel={sel_start}:{sel_end}")
+    except Exception as e:
+        log(f"[sync] _sync_field_to_android_thread error: {e}")
+    finally:
+        ctypes.windll.ole32.CoUninitialize()
+
+
 # ── Auto show/hide: focus watcher (UI Automation) ────────────────────────────
 # Editable control types we treat as "an input box" (by ControlTypeName).
 _EDITABLE_CTRLS = {"EditControl", "DocumentControl", "ComboBoxControl"}
@@ -951,9 +1045,11 @@ def _focus_watcher():
         return
     auto.SetGlobalSearchTimeout(0.5)
     log("[auto] focus watcher started")
-    last_beat = time.time()
-    suppress_sig = None   # focus signature where physical typing hid the keyboard;
-                          # don't re-raise for the SAME field until focus moves away.
+    last_beat     = time.time()
+    suppress_sig  = None   # focus signature where physical typing hid the keyboard;
+                           # don't re-raise for the SAME field until focus moves away.
+    last_field_sig = None  # sig of the last field we sent SYNC for
+    last_cursor    = None  # (sel_start, sel_end) of last CURSOR command sent
     while True:
         # The ENTIRE body is guarded: a single uncaught exception here used to kill
         # the thread, silently disabling auto show/hide "after a while". Now it logs
@@ -1003,10 +1099,31 @@ def _focus_watcher():
             if editable:
                 if not shown and sig != suppress_sig:
                     show_emulator(manual=False)
+                # ── Android buffer sync ─────────────────────────────────────
+                if sig != last_field_sig:
+                    # Field changed: full text+cursor sync (background thread so
+                    # UIA reads don't block this poll loop)
+                    last_field_sig = sig
+                    last_cursor    = None
+                    threading.Thread(
+                        target=_sync_field_to_android_thread, daemon=True).start()
+                elif not typed and time.time() - _last_inject_time > 0.4:
+                    # Same field: poll cursor for mouse-click repositioning.
+                    # EM_GETSEL is fast enough to call inline every 250 ms.
+                    try:
+                        cur = _get_cursor_only(ctrl)
+                        if cur is not None and cur != last_cursor:
+                            last_cursor = cur
+                            send_to_android(f"CURSOR:{cur[0]}:{cur[1]}")
+                    except Exception:
+                        pass
             else:
                 # Only auto-hide a keyboard that auto raised — never a manual one.
                 if shown and _auto_shown:
                     hide_emulator()
+                if last_field_sig is not None:
+                    last_field_sig = None
+                    last_cursor    = None
         except Exception as e:
             log(f"[auto] watcher loop error (continuing): {e!r}")
             time.sleep(0.5)

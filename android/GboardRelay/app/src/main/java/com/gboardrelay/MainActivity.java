@@ -190,9 +190,14 @@ public class MainActivity extends Activity {
                             new InputStreamReader(s.getInputStream()));
                     String line;
                     while ((line = reader.readLine()) != null) {
-                        // Server can send "CLEAR" to reset the field
                         if ("CLEAR".equals(line)) {
                             mainHandler.post(() -> inputField.resetBuffer());
+                        } else if (line.startsWith("SYNC:")) {
+                            final String payload = line.substring(5);
+                            mainHandler.post(() -> handleSync(payload));
+                        } else if (line.startsWith("CURSOR:")) {
+                            final String payload = line.substring(7);
+                            mainHandler.post(() -> handleCursor(payload));
                         }
                     }
                 } catch (Exception e) {
@@ -215,6 +220,37 @@ public class MainActivity extends Activity {
                 catch (Exception ignored) {}
             }
         });
+    }
+
+    // ── Host→app command handlers ────────────────────────────────────────────
+
+    /** SYNC:<base64text>:<sel_start>:<sel_end>
+     *  Replace the relay buffer with the current Windows field text and cursor. */
+    private void handleSync(String payload) {
+        try {
+            // payload format: <base64>:<start>:<end>  (base64 has no colons)
+            int c1 = payload.indexOf(':');
+            int c2 = payload.indexOf(':', c1 + 1);
+            if (c1 < 0 || c2 < 0) return;
+            byte[] decoded = android.util.Base64.decode(
+                    payload.substring(0, c1), android.util.Base64.DEFAULT);
+            String text     = new String(decoded, "UTF-8");
+            int    selStart = Integer.parseInt(payload.substring(c1 + 1, c2));
+            int    selEnd   = Integer.parseInt(payload.substring(c2 + 1));
+            inputField.syncFromHost(text, selStart, selEnd);
+        } catch (Exception ignored) {}
+    }
+
+    /** CURSOR:<sel_start>:<sel_end>
+     *  Move the relay cursor to match a mouse-click reposition in Windows. */
+    private void handleCursor(String payload) {
+        try {
+            int colon = payload.indexOf(':');
+            if (colon < 0) return;
+            int selStart = Integer.parseInt(payload.substring(0, colon));
+            int selEnd   = Integer.parseInt(payload.substring(colon + 1));
+            inputField.setCursorFromHost(selStart, selEnd);
+        } catch (Exception ignored) {}
     }
 
     // ── UI helpers ───────────────────────────────────────────────────────────

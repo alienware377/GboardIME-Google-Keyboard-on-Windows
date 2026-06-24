@@ -97,17 +97,26 @@ lands in the focused Windows app.
 
 ## Relay protocol (newline-delimited TCP)
 
+**App → host** (Gboard input events):
+
 | Command | Meaning |
 |---------|---------|
 | `TEXT:<chars>` | Forward these characters |
 | `DEL:<n>` | Send `n` backspaces |
-| `KEY:ENTER` | Send Enter |
-| `KEY:TAB` | Send Tab |
+| `KEY:<spec>` | Send a key: `ENTER`, `TAB`, `SHIFT+LEFT`, `CTRL+A`, etc. |
 | `PING` | Keepalive |
-| `CLEAR` (host→app) | Reset the relay's editor buffer |
+
+**Host → app** (Windows field sync):
+
+| Command | Meaning |
+|---------|---------|
+| `CLEAR` | Reset the relay's editor buffer |
+| `SYNC:<base64text>:<start>:<end>` | Replace buffer with the focused Windows field's text and cursor position |
+| `CURSOR:<start>:<end>` | Update cursor/selection without changing text (mouse-click reposition) |
 
 Commands are written on a single serialized thread so delete/text/commit sequences keep their
-exact order.
+exact order. The host sends `SYNC:` whenever the Windows focus moves to a new text field, and
+`CURSOR:` when the caret moves within the same field (e.g. a mouse click).
 
 ## Notes & quirks
 

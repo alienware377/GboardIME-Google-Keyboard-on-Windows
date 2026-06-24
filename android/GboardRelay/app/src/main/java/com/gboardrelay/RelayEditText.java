@@ -85,6 +85,39 @@ public class RelayEditText extends EditText {
         prevText = "";
     }
 
+    /** Called on SYNC: from the Windows host — replaces buffer with the current
+     *  Windows field text and positions the cursor to match.
+     *  Guarded with icHandled so the TextWatcher doesn't relay the setText back. */
+    public void syncFromHost(String text, int selStart, int selEnd) {
+        composing = "";
+        icHandled = true;
+        try {
+            setText(text);
+            int len = text.length();
+            int s = Math.max(0, Math.min(selStart, len));
+            int e = Math.max(0, Math.min(selEnd,   len));
+            setSelection(s, e);
+        } finally {
+            icHandled = false;
+        }
+        prevText = text;
+    }
+
+    /** Called on CURSOR: from the Windows host — moves the Android cursor to match
+     *  a mouse-click reposition in Windows. Guarded with icHandled so our
+     *  setSelection override doesn't re-emit a KEY:CTRL+HOME/END. */
+    public void setCursorFromHost(int selStart, int selEnd) {
+        icHandled = true;
+        try {
+            int len = getText() != null ? getText().length() : 0;
+            int s = Math.max(0, Math.min(selStart, len));
+            int e = Math.max(0, Math.min(selEnd,   len));
+            setSelection(s, e);
+        } finally {
+            icHandled = false;
+        }
+    }
+
     private void send(String cmd) {
         Sender s = sender;
         if (s != null) s.send(cmd);
