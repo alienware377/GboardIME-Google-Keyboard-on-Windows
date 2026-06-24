@@ -48,13 +48,17 @@ shortcuts.
 
 ## Install
 
-1. Download the project: **Code → Download ZIP**, then extract it (keep all files together).
-2. **Double-click `Setup.exe`** in the extracted folder.
+1. Download **`Setup.exe`** from the [latest release](../../releases/latest).
+2. Double-click it. That's it — `Setup.exe` is fully self-contained (the entire project is bundled
+   inside it). It unpacks to `%LOCALAPPDATA%\Programs\GboardIME` and runs the installer.
 
-> `Setup.exe` is an unsigned launcher, so Windows SmartScreen may show *"Windows protected your
-> PC"* — click **More info → Run anyway**. It simply runs `install.ps1` next to it. If you'd
-> rather not use the .exe, double-click `Install.cmd` or run
-> `powershell -ExecutionPolicy Bypass -File install.ps1` instead — all three do the same thing.
+> `Setup.exe` is **signed**, but with a self-signed certificate (not a paid CA cert), so Windows
+> SmartScreen will still show *"Windows protected your PC"* on first run — click
+> **More info → Run anyway**. The public certificate (`setup/GboardIME-codesign.cer`) is in the
+> repo if you want to inspect or trust it.
+
+Prefer not to use the .exe? Clone the repo and run `Install.cmd` or
+`powershell -ExecutionPolicy Bypass -File install.ps1` — same result.
 
 The installer is idempotent and does everything end-to-end:
 

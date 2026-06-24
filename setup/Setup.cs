@@ -1,78 +1,94 @@
-// GboardIME Setup.exe — thin native launcher.
+// GboardIME Setup.exe - self-contained installer.
 //
-// Lives in the repo root and runs the sibling install.ps1 with a Bypass execution
-// policy, so end users get a familiar double-clickable .exe instead of having to
-// invoke PowerShell themselves. All real work lives in install.ps1 (single source
-// of truth); this just locates it next to the .exe and launches it.
+// Bundles the ENTIRE project (install.ps1, launch/stop scripts, the relay APK,
+// the Windows host, android sources, debloat list) as an embedded zip resource.
+// On run it extracts everything to %LOCALAPPDATA%\Programs\GboardIME and launches
+// install.ps1 from there - so a single .exe is all the user needs, no extra files.
 //
-// Build (no external tooling needed):
-//   csc.exe /target:exe /out:Setup.exe /win32icon:setup\app.ico setup\Setup.cs
-//   (icon optional)
+// Build: see setup\build-setup.ps1 (compiles with the in-box .NET csc.exe and
+// embeds setup\payload.zip as the resource "GboardIME.payload.zip").
 //
-// Debug: run `Setup.exe --print` to print the command it WOULD run, then exit.
+// Flags:
+//   --dir <path>   extract to a custom folder (default %LOCALAPPDATA%\Programs\GboardIME)
+//   --extract-only unpack but don't run the installer
+//   anything else  passed through to install.ps1 (e.g. -SkipDebloat)
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection;
 using System.Text;
 
 internal static class Setup
 {
+    private const string ResourceName = "GboardIME.payload.zip";
+
     private static int Main(string[] args)
     {
-        // Directory the .exe lives in (the repo root).
-        string exeDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-        string installPs1 = Path.Combine(exeDir, "install.ps1");
-
-        // Pass through any extra args (e.g. -SkipDebloat), except our own --print flag.
+        string targetDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Programs", "GboardIME");
+        bool extractOnly = false;
         var passthrough = new StringBuilder();
-        bool printOnly = false;
-        foreach (string a in args)
+
+        for (int i = 0; i < args.Length; i++)
         {
-            if (string.Equals(a, "--print", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a, "/print", StringComparison.OrdinalIgnoreCase))
+            string a = args[i];
+            if (a.Equals("--dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
-                printOnly = true;
-                continue;
+                targetDir = args[++i];
             }
-            passthrough.Append(' ').Append(a);
+            else if (a.Equals("--extract-only", StringComparison.OrdinalIgnoreCase))
+            {
+                extractOnly = true;
+            }
+            else
+            {
+                passthrough.Append(' ').Append(a);
+            }
         }
 
-        string psArgs = string.Format(
-            "-NoProfile -ExecutionPolicy Bypass -File \"{0}\"{1}",
-            installPs1, passthrough.ToString());
+        Console.WriteLine("GboardIME setup");
+        Console.WriteLine("===============");
+        Console.WriteLine("Install folder: " + targetDir);
+        Console.WriteLine();
 
-        if (printOnly)
+        try
         {
-            Console.WriteLine("powershell.exe " + psArgs);
-            Console.WriteLine("(install.ps1 expected at: " + installPs1 + ")");
-            Console.WriteLine("exists: " + File.Exists(installPs1));
-            return 0;
+            ExtractPayload(targetDir);
         }
-
-        if (!File.Exists(installPs1))
+        catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("ERROR: install.ps1 was not found next to Setup.exe.");
-            Console.ResetColor();
-            Console.WriteLine("Keep Setup.exe inside the GboardIME folder (don't move it out on its own).");
-            Console.WriteLine("Expected: " + installPs1);
-            Console.WriteLine();
-            Console.WriteLine("Press any key to close.");
-            Console.ReadKey();
+            Fail("Could not unpack the bundled files: " + ex.Message);
             return 1;
         }
 
-        Console.WriteLine("Starting GboardIME installer...");
+        string installPs1 = Path.Combine(targetDir, "install.ps1");
+        if (!File.Exists(installPs1))
+        {
+            Fail("install.ps1 missing after extraction (corrupt build?).");
+            return 1;
+        }
+
+        if (extractOnly)
+        {
+            Console.WriteLine("Extracted to " + targetDir + " (--extract-only; installer not run).");
+            return 0;
+        }
+
+        Console.WriteLine("Files unpacked. Starting installer...");
         Console.WriteLine();
 
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
-            Arguments = psArgs,
-            UseShellExecute = false,   // inherit this console so the user sees progress
-            WorkingDirectory = exeDir
+            Arguments = string.Format(
+                "-NoProfile -ExecutionPolicy Bypass -File \"{0}\"{1}",
+                installPs1, passthrough.ToString()),
+            UseShellExecute = false,
+            WorkingDirectory = targetDir
         };
 
         int exit;
@@ -86,15 +102,49 @@ internal static class Setup
         }
         catch (Exception ex)
         {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("Failed to launch PowerShell: " + ex.Message);
-            Console.ResetColor();
-            exit = 1;
+            Fail("Failed to launch PowerShell: " + ex.Message);
+            return 1;
         }
 
         Console.WriteLine();
         Console.WriteLine("Installer finished (exit code " + exit + "). Press any key to close.");
         Console.ReadKey();
         return exit;
+    }
+
+    private static void ExtractPayload(string targetDir)
+    {
+        Directory.CreateDirectory(targetDir);
+        Assembly asm = Assembly.GetExecutingAssembly();
+        using (Stream res = asm.GetManifestResourceStream(ResourceName))
+        {
+            if (res == null)
+                throw new Exception("embedded payload not found (" + ResourceName + ")");
+            using (var zip = new ZipArchive(res, ZipArchiveMode.Read))
+            {
+                foreach (ZipArchiveEntry entry in zip.Entries)
+                {
+                    string outPath = Path.Combine(targetDir, entry.FullName.Replace('/', '\\'));
+                    if (entry.FullName.EndsWith("/") || string.IsNullOrEmpty(entry.Name))
+                    {
+                        Directory.CreateDirectory(outPath);
+                        continue;
+                    }
+                    string dir = Path.GetDirectoryName(outPath);
+                    if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                    entry.ExtractToFile(outPath, true);  // overwrite on re-run
+                }
+            }
+        }
+    }
+
+    private static void Fail(string msg)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine("ERROR: " + msg);
+        Console.ResetColor();
+        Console.WriteLine();
+        Console.WriteLine("Press any key to close.");
+        Console.ReadKey();
     }
 }
