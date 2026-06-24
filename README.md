@@ -1,9 +1,28 @@
-# GboardIME — Google Keyboard on Windows
+# GboardIME — Google Keyboard (Gboard) on Windows · Swipe / Glide Typing for PC
 
-Type and **glide-type (swipe)** on the real Google Keyboard (Gboard) and have the text
-appear in any focused Windows application. Gboard runs inside an Android emulator; a tiny
-relay app captures its actual input events and forwards them to a Windows host process that
-replays them with `SendInput`. Everything stays on `localhost` — no external network is used.
+> **Use Gboard on Windows.** Get the real Google Keyboard — including swipe / glide typing,
+> next-word predictions, voice typing, emoji search, multilingual layouts, and the
+> clipboard manager — as a desktop IME for Windows 10 and 11. Type with your mouse or
+> touchscreen the same way you type on Android.
+
+Type and **swipe (glide / gesture type)** on the real **Google Keyboard (Gboard)** and have
+the text appear in any focused Windows application. Gboard runs inside an Android emulator;
+a tiny relay app captures its actual input events and forwards them to a Windows host
+process that replays them with `SendInput`. Everything stays on `localhost` — no external
+network is used, no telemetry, no account required.
+
+**Why this exists.** Windows has no first-party swipe / glide-typing keyboard and no built-in
+Gboard equivalent. The Windows on-screen touch keyboard does not glide-type accurately, has
+no Gboard suggestion model, and lacks Gboard features like the clipboard tool and emoji
+search. GboardIME bridges the real Gboard to any Windows app so you get phone-quality typing
+on a desktop — useful on touchscreen laptops, Surface devices, tablets running Windows, and
+for anyone who prefers Gboard's autocorrect and gesture engine over Windows' on-screen
+keyboard. **Free, open-source, fully offline.**
+
+**Keywords:** Gboard for Windows, Google Keyboard on PC, swipe typing Windows, glide typing
+desktop, Android keyboard Windows, on-screen keyboard alternative, touchscreen typing
+Windows 11, Gboard desktop client, Gboard IME, virtual keyboard with swipe, Android emulator
+keyboard.
 
 ```
 ┌──────────────────────────────┐         ┌───────────────────────────┐
@@ -137,5 +156,31 @@ exact order. The host sends `SYNC:` whenever the Windows focus moves to a new te
 
 ## License
 
-Personal project. Gboard and Google Keyboard are trademarks of Google LLC; this project does not
-redistribute Gboard — you install it yourself inside the emulator.
+[MIT](LICENSE). Gboard and Google Keyboard are trademarks of Google LLC; this project does
+not redistribute Gboard — you install it yourself inside the emulator.
+
+## FAQ
+
+**Is this an official Google product?** No. It's an independent open-source project that
+relays a real Gboard install (which you provide inside the emulator) to Windows. Not
+affiliated with or endorsed by Google.
+
+**Does this work with swipe / gesture typing?** Yes — that's the main reason it exists.
+Glide-typed words land in your Windows app exactly as Gboard would produce them on Android,
+including the auto-spacing and corrections.
+
+**Does it work on Windows 10? Windows 11?** Both. Any 64-bit Windows 10/11 with virtualization
+enabled (for the Android emulator) and a working GPU.
+
+**Is internet required?** No, after install. Setup downloads the Android SDK and the system
+image; after that everything runs offline on `localhost`. Gboard's prediction, gesture
+engine, and language model are fully on-device.
+
+**Does this collect any data?** No. The relay is `localhost` only, no telemetry, no account.
+
+**Can I use it on a Surface / 2-in-1 / touchscreen laptop?** Yes. This is the primary use
+case — phone-style typing on Windows touchscreens.
+
+**Why does it need an Android emulator?** Because Gboard is an Android app. The emulator
+gives Gboard a real Android environment to run in; the host relays its real `InputConnection`
+events to Windows. There is no open Gboard SDK or desktop build.
