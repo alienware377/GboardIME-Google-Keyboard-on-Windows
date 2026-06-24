@@ -1,6 +1,9 @@
 package com.gboardrelay;
 
 import android.app.Activity;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
+import android.content.Context;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -10,6 +13,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.view.View;
+import android.view.MotionEvent;
 import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -64,15 +68,43 @@ public class MainActivity extends Activity {
         // delete, swipe-delete) straight to the Windows host — no fragile diff.
         inputField.setSender(this::sendCmd);
 
+        enterKioskMode();
         showKeyboard();
         connectLoop();
+    }
+
+    // ── Lock Task (kiosk) mode ──────────────────────────────────────────────────
+
+    /** If this app has been made Device Owner
+     *  (`adb shell dpm set-device-owner com.gboardrelay/.RelayAdminReceiver`),
+     *  whitelist itself and pin into Lock Task mode. That fully disables Home,
+     *  Recents, and the gesture-nav swipe-up, so the keyboard can't be accidentally
+     *  swiped away. If we're not Device Owner, this is a harmless no-op. */
+    private void enterKioskMode() {
+        try {
+            DevicePolicyManager dpm =
+                    (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            ComponentName admin = new ComponentName(this, RelayAdminReceiver.class);
+            if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
+                dpm.setLockTaskPackages(admin, new String[]{ getPackageName() });
+            }
+            // startLockTask() works when the package is lock-task-whitelisted (above);
+            // otherwise it falls back to screen-pinning (which shows a confirm dialog),
+            // so only call it when we're whitelisted as Device Owner.
+            if (dpm != null && dpm.isLockTaskPermitted(getPackageName())) {
+                startLockTask();
+            }
+        } catch (Exception ignored) {
+            // Not provisioned as Device Owner — keyboard still works normally.
+        }
     }
 
     // ── Immersive mode (hide the Android status/navigation bars) ────────────────
 
     /** Hide the system status + navigation bars so the relay window is all app,
-     *  shortening the wasted strip at the top of the emulator. Sticky immersive so
-     *  the bars stay hidden after the soft keyboard or a swipe. */
+     *  shortening the wasted strip at the top of the emulator. The bars stay hidden
+     *  permanently — swiping from the bottom does NOT reveal the navbar or open
+     *  recents/home, preventing accidental app exits. */
     private void hideSystemBars() {
         // Draw edge-to-edge: the activity content extends behind (and replaces) the
         // status + navigation bars, so there's no fixed black inset band at the top.
@@ -87,8 +119,9 @@ public class MainActivity extends Activity {
             WindowInsetsController c = getWindow().getInsetsController();
             if (c != null) {
                 c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
-                c.setSystemBarsBehavior(
-                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                // BEHAVIOR_SHOW_BARS_BY_TOUCH only shows on touch in the bar area — prevents gesture
+                // navigation from triggering recents/home on swipe-up from bottom
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_BARS_BY_TOUCH);
             }
         } else {
             View decor = getWindow().getDecorView();
@@ -112,6 +145,9 @@ public class MainActivity extends Activity {
     public boolean dispatchKeyEvent(KeyEvent event) {
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             switch (event.getKeyCode()) {
+                case KeyEvent.KEYCODE_BACK:
+                    // Consume back button — prevent accidental exit
+                    return true;
                 case KeyEvent.KEYCODE_ENTER:
                     sendCmd("KEY:ENTER");
                     return true;
@@ -121,6 +157,19 @@ public class MainActivity extends Activity {
             }
         }
         return super.dispatchKeyEvent(event);
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        // Block all touches in the bottom gesture-nav area (~80px) to prevent swipe-up
+        // from opening recents/app switcher. This intercepts BEFORE the system gesture
+        // handler sees the touch, at the earliest dispatch point.
+        float bottomThreshold = getWindow().getDecorView().getHeight() - 80;
+        if (event.getY() > bottomThreshold) {
+            // Block the gesture — return true to consume and prevent system handling
+            return true;
+        }
+        return super.dispatchTouchEvent(event);
     }
 
     // ── Networking ───────────────────────────────────────────────────────────
