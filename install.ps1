@@ -189,10 +189,12 @@ if ($SkipEmulator) {
     function Get-Serial { foreach($l in (& $ADB devices)){ if($l -match '^(emulator-\d+)\s+device'){ return $matches[1] } } ; return $null }
     $serial = Get-Serial
     if (-not $serial) {
-        Start-Process $EMULATOR -ArgumentList @(
-            "-avd",$AVD_NAME,"-no-snapshot-load","-no-snapshot-save",
-            "-writable-system","-no-boot-anim","-gpu","host","-memory","2048"
-        ) -WindowStyle Normal
+        # Hidden launch (window style 0) so the emulator's noisy log console never
+        # shows; the Android display (separate Qt window) still appears.
+        $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
+                   "-writable-system -no-boot-anim -no-metrics -gpu host -memory 2048"
+        $wshRun = New-Object -ComObject WScript.Shell
+        $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
         Info "Waiting for boot (up to 4 min)..."
         $t=0
         do {

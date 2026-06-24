@@ -43,10 +43,14 @@ if(-not $serial){
     # a stale snapshot. -no-snapshot-save keeps it from persisting RAM state.
     # -writable-system is REQUIRED so the system Gboard 12.4 overlay stays in place;
     # without it the keyboard reverts to the stock preload state.
-    Start-Process $EMULATOR -ArgumentList @(
-        "-avd", $AVD_NAME, "-no-snapshot-load", "-no-snapshot-save",
-        "-writable-system", "-no-boot-anim", "-gpu", "host", "-memory", "2048"
-    ) -WindowStyle Normal
+    #
+    # Launch via WScript.Shell.Run with window style 0 (hidden) so the emulator's
+    # noisy console/log window never appears. The Android display (a separate Qt
+    # window) still shows normally; only the text-log console is suppressed.
+    $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
+               "-writable-system -no-boot-anim -no-metrics -gpu host -memory 2048"
+    $wshRun = New-Object -ComObject WScript.Shell
+    $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
     Log "Waiting for emulator to boot (up to 3 min)..."
     $elapsed = 0
     do {
