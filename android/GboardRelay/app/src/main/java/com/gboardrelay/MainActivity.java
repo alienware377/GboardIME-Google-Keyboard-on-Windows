@@ -55,6 +55,13 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+        // Paint the window (and the status/nav-bar regions) the same dark slate as the
+        // input field, so the hidden-bar / cutout insets never show as a black strip
+        // above the box. Must run before/with hideSystemBars().
+        final int SLATE = 0xFF263238;
+        getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(SLATE));
+        getWindow().setStatusBarColor(android.graphics.Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(android.graphics.Color.TRANSPARENT);
         hideSystemBars();   // after setContentView: needs the decor view / insets controller
 
         inputField = findViewById(R.id.input_field);

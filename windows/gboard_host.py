@@ -385,8 +385,13 @@ def dispatch(cmd: str):
         # KEY:CTRL+A, KEY:CTRL+SHIFT+HOME. Backward compatible with all old KEY:* names.
         spec = cmd[4:]
         parts = spec.split("+")
-        if parts[-1].strip().upper() in _KEY_VK:
+        keyname = parts[-1].strip().upper()
+        if keyname in _KEY_VK:
             _inject_into_target(lambda: inject_key_spec(spec))
+            # A bare Enter often submits a chat message and blanks the input box.
+            # Arm a re-sync so Gboard's buffer follows the now-empty field.
+            if keyname == "ENTER" and len(parts) == 1:
+                _arm_resync()
         else:
             log(f"[key] unknown key spec: {spec!r}")
     elif cmd.startswith("CROP:"):
@@ -898,6 +903,25 @@ def _titlebar_thread():
 
 # ── Android bi-directional sync (host → relay app) ───────────────────────────
 
+# Re-sync coordination. After a bare Enter (which usually submits a chat message and
+# blanks the input box) we want ONE fresh SYNC so Gboard follows the now-empty field.
+# The stable-key logic suppresses it (same field identity), so we arm a short retry
+# DEADLINE the focus watcher honours. A deadline (not a one-shot Event) is used because
+# Electron/UIA focus detection flickers — a single attempt at a fixed delay often lands
+# on a tick where the field reads as non-editable and is silently missed. The watcher
+# retries every tick until it catches an editable focus, or the window expires.
+_last_sync_key      = None   # owned by the focus watcher; module-level so Enter can reset it
+_resync_deadline    = 0.0    # wall-clock; while now < this, the watcher keeps trying to resync
+_resync_base_inject = 0.0    # _last_inject_time at Enter; cancels the resync if a newer inject appears
+
+def _arm_resync(window=2.5):
+    """Arm a one-shot field re-sync, retried for up to `window` seconds. Cancelled
+    automatically if the user starts typing a NEW message before it fires (so it can
+    never wipe in-progress text)."""
+    global _resync_deadline, _resync_base_inject
+    _resync_base_inject = _last_inject_time
+    _resync_deadline    = time.time() + window
+
 def send_to_android(cmd: str) -> bool:
     """Write a newline-terminated command to the connected Android relay app.
     Returns True only if the bytes were actually handed to a live socket."""
@@ -1087,12 +1111,13 @@ def _focus_watcher():
     except Exception as e:
         log(f"[auto] uiautomation unavailable: {e!r}")
         return
+    global _last_sync_key, _resync_deadline
     auto.SetGlobalSearchTimeout(0.5)
     log("[auto] focus watcher started")
     last_beat     = time.time()
     suppress_sig  = None   # focus signature where physical typing hid the keyboard;
                            # don't re-raise for the SAME field until focus moves away.
-    last_sync_key  = None  # stable identity of the last field we sent SYNC for
+    _last_sync_key = None  # stable identity of the last field we sent SYNC for
     last_cursor    = None  # (sel_start, sel_end) of last CURSOR command sent
     while True:
         # The ENTIRE body is guarded: a single uncaught exception here used to kill
@@ -1145,20 +1170,36 @@ def _focus_watcher():
                     show_emulator(manual=False)
                 # ── Android buffer sync ─────────────────────────────────────
                 skey = _sync_key(fg, ctrl)
-                since_inject = time.time() - _last_inject_time
-                if skey is not None and skey != last_sync_key:
+                now2 = time.time()
+                since_inject = now2 - _last_inject_time
+                # A new message typed since Enter cancels the pending Enter-resync,
+                # so it can never clobber text the user is now building.
+                if _resync_deadline and _last_inject_time > _resync_base_inject + 0.05:
+                    _resync_deadline = 0.0
+                resync_armed = _resync_deadline and now2 < _resync_deadline
+
+                if resync_armed and since_inject > 0.4:
+                    # Enter-resync: the box has settled (~0.4s past the Enter inject)
+                    # and the user hasn't started a new message. Re-read the SAME field
+                    # (now usually blank) and SYNC, even though its identity is unchanged.
+                    _resync_deadline = 0.0
+                    _last_sync_key = skey
+                    last_cursor    = None
+                    threading.Thread(
+                        target=_sync_field_to_android_thread, daemon=True).start()
+                elif skey is not None and skey != _last_sync_key:
                     # Genuinely a DIFFERENT field. Only push a fresh SYNC once the
                     # relay has been quiet for >1s — otherwise a field switch right
                     # after typing (or a stray re-focus mid-glide) would setText()
                     # over the buffer the user is still building. If the guard is
-                    # active we leave last_sync_key unchanged so it retries next tick.
+                    # active we leave _last_sync_key unchanged so it retries next tick.
                     if since_inject > 1.0:
-                        last_sync_key = skey
-                        last_cursor   = None
+                        _last_sync_key = skey
+                        last_cursor    = None
                         threading.Thread(
                             target=_sync_field_to_android_thread, daemon=True).start()
-                elif skey is not None and skey == last_sync_key \
-                        and not typed and since_inject > 0.4:
+                elif skey is not None and skey == _last_sync_key \
+                        and not typed and since_inject > 0.4 and not resync_armed:
                     # Same field: poll cursor for mouse-click repositioning.
                     # EM_GETSEL is fast enough to call inline every 250 ms.
                     try:
