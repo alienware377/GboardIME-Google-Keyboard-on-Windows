@@ -48,7 +48,13 @@ shortcuts.
 
 ## Install
 
-The easiest path: **double-click `Install.cmd`** (or run `powershell -ExecutionPolicy Bypass -File install.ps1`).
+1. Download the project: **Code → Download ZIP**, then extract it (keep all files together).
+2. **Double-click `Setup.exe`** in the extracted folder.
+
+> `Setup.exe` is an unsigned launcher, so Windows SmartScreen may show *"Windows protected your
+> PC"* — click **More info → Run anyway**. It simply runs `install.ps1` next to it. If you'd
+> rather not use the .exe, double-click `Install.cmd` or run
+> `powershell -ExecutionPolicy Bypass -File install.ps1` instead — all three do the same thing.
 
 The installer is idempotent and does everything end-to-end:
 
