@@ -102,6 +102,23 @@ public class RelayEditText extends EditText {
 
     private void sendDel(int n) { if (n > 0) send("DEL:" + n); }
 
+    /** Map a cursor-movement keycode to a host KEY name, or null if it's not a
+     *  navigation key we forward. Text-changing keys (DEL, ENTER, TAB) return null
+     *  on purpose - those are handled elsewhere. */
+    private static String navKeyName(int code) {
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:  return "LEFT";
+            case KeyEvent.KEYCODE_DPAD_RIGHT: return "RIGHT";
+            case KeyEvent.KEYCODE_DPAD_UP:    return "UP";
+            case KeyEvent.KEYCODE_DPAD_DOWN:  return "DOWN";
+            case KeyEvent.KEYCODE_MOVE_HOME:  return "HOME";
+            case KeyEvent.KEYCODE_MOVE_END:   return "END";
+            case KeyEvent.KEYCODE_PAGE_UP:    return "PAGEUP";
+            case KeyEvent.KEYCODE_PAGE_DOWN:  return "PAGEDOWN";
+            default: return null;
+        }
+    }
+
     /** Chars currently selected — the range Gboard is about to replace/delete. */
     private int selectionLen() {
         int a = getSelectionStart(), b = getSelectionEnd();
@@ -249,20 +266,65 @@ public class RelayEditText extends EditText {
 
             @Override
             public boolean setSelection(int start, int end) {
-                Log.d(TAG, "setSelection(" + start + "," + end + ")");
+                Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled);
+                // Gboard's panel "jump to start" (|<) and "jump to end" (>|) buttons move
+                // the cursor via setSelection, not a key event. Forward those as
+                // Ctrl+Home / Ctrl+End. Guard hard against false positives: only when the
+                // change is NOT from our own text mutation (icHandled), the cursor is
+                // collapsed, AND it jumped to an absolute boundary by more than one
+                // position (so per-keystroke cursor advances never trigger it).
+                if (!icHandled && start == end) {
+                    int len = getText() != null ? getText().length() : 0;
+                    int curPos = getSelectionStart();   // real cursor BEFORE the jump
+                    if (Math.abs(start - curPos) > 1) {
+                        if (start <= 0)        send("KEY:CTRL+HOME");
+                        else if (start >= len) send("KEY:CTRL+END");
+                    }
+                }
                 return super.setSelection(start, end);
             }
 
             @Override
             public boolean sendKeyEvent(KeyEvent event) {
-                // Log only. We deliberately DON'T forward DEL here: letting the base
-                // connection apply the key edits the field, which the TextWatcher
-                // safety net then forwards as DEL (single source of truth). ENTER/TAB
-                // are handled by Activity.dispatchKeyEvent.
                 Log.d(TAG, "sendKeyEvent action=" + event.getAction()
-                        + " code=" + event.getKeyCode() + " sel=" + selectionLen()
-                        + " composing=" + composing);
+                        + " code=" + event.getKeyCode() + " meta=" + event.getMetaState()
+                        + " sel=" + selectionLen() + " composing=" + composing);
+                // Forward cursor-movement / selection keys (the Gboard text-editing
+                // panel: arrows, Home/End, the "Select" toggle = Shift held). We do NOT
+                // forward text-CHANGING keys here: DEL is left to the TextWatcher safety
+                // net (single source of truth), ENTER/TAB go via Activity.dispatchKeyEvent.
+                // The base connection still applies the key so the relay field's cursor
+                // and selection mirror the Windows side (keeps Copy/Cut accurate).
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    String name = navKeyName(event.getKeyCode());
+                    if (name != null) {
+                        int meta = event.getMetaState();
+                        String mods = "";
+                        if ((meta & KeyEvent.META_CTRL_ON) != 0)  mods += "CTRL+";
+                        if ((meta & KeyEvent.META_SHIFT_ON) != 0) mods += "SHIFT+";
+                        if ((meta & KeyEvent.META_ALT_ON) != 0)   mods += "ALT+";
+                        send("KEY:" + mods + name);
+                    }
+                }
                 return super.sendKeyEvent(event);
+            }
+
+            @Override
+            public boolean performContextMenuAction(int id) {
+                // The panel's Select all / Copy / Cut / Paste buttons. Mirror them to
+                // Windows as the standard Ctrl shortcuts. Select all / Copy / Cut also
+                // run on the base field so its selection stays in sync; Paste is NOT run
+                // on the base (the emulator clipboard differs from Windows') - we only
+                // forward Ctrl+V so Windows pastes its own clipboard.
+                Log.d(TAG, "performContextMenuAction(" + id + ")");
+                if (id == android.R.id.selectAll) { send("KEY:CTRL+A"); }
+                else if (id == android.R.id.copy) { send("KEY:CTRL+C"); }
+                else if (id == android.R.id.cut)  { send("KEY:CTRL+X"); }
+                else if (id == android.R.id.paste) {
+                    send("KEY:CTRL+V");
+                    return true;   // skip base paste to avoid emulator-clipboard desync
+                }
+                return super.performContextMenuAction(id);
             }
 
             @Override

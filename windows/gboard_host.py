@@ -84,6 +84,19 @@ VK_DOWN    = 0x28
 VK_DELETE  = 0x2E
 VK_HOME    = 0x24
 VK_END     = 0x23
+VK_PRIOR   = 0x21   # Page Up
+VK_NEXT    = 0x22   # Page Down
+VK_INSERT  = 0x2D
+# Modifiers
+VK_SHIFT   = 0x10
+VK_CONTROL = 0x11
+VK_MENU    = 0x12   # Alt
+# Letters used in Ctrl-combos (copy/paste/cut/select-all/undo)
+VK_A = 0x41
+VK_C = 0x43
+VK_V = 0x56
+VK_X = 0x58
+VK_Z = 0x5A
 
 SW_HIDE    = 0
 SW_SHOWNOACTIVATE = 4   # restore (un-minimize) to last size without activating
@@ -227,6 +240,42 @@ def inject_vk(vk, extended=False):
         _make_ki(vk=vk, flags=flags | KEYEVENTF_KEYUP),
     )
 
+def inject_combo(mod_vks, vk, extended=False):
+    """Press modifier keys (Shift/Ctrl/Alt), tap vk, release modifiers in reverse.
+    Powers selection (Shift+arrows), word jumps, and Ctrl+A/C/V/X/Z."""
+    flags = KEYEVENTF_EXTENDEDKEY if extended else 0
+    seq = [_make_ki(vk=m) for m in mod_vks]
+    seq.append(_make_ki(vk=vk, flags=flags))
+    seq.append(_make_ki(vk=vk, flags=flags | KEYEVENTF_KEYUP))
+    seq.extend(_make_ki(vk=m, flags=KEYEVENTF_KEYUP) for m in reversed(mod_vks))
+    _send(*seq)
+
+# Named keys -> (vk, is_extended). Extended = the grey nav cluster (arrows, home,
+# end, delete, page up/down, insert) so Windows treats them as the nav keys.
+_KEY_VK = {
+    "ENTER": (VK_RETURN, False), "TAB": (VK_TAB, False),
+    "BACKSPACE": (VK_BACK, False), "BACK": (VK_BACK, False),
+    "DELETE": (VK_DELETE, True), "INSERT": (VK_INSERT, True),
+    "LEFT": (VK_LEFT, True), "RIGHT": (VK_RIGHT, True),
+    "UP": (VK_UP, True), "DOWN": (VK_DOWN, True),
+    "HOME": (VK_HOME, True), "END": (VK_END, True),
+    "PAGEUP": (VK_PRIOR, True), "PAGEDOWN": (VK_NEXT, True),
+    "A": (VK_A, False), "C": (VK_C, False), "V": (VK_V, False),
+    "X": (VK_X, False), "Z": (VK_Z, False),
+}
+_MOD_VK = {"SHIFT": VK_SHIFT, "CTRL": VK_CONTROL, "CONTROL": VK_CONTROL, "ALT": VK_MENU}
+
+def inject_key_spec(spec):
+    """spec like 'LEFT', 'SHIFT+LEFT', 'CTRL+A', 'CTRL+SHIFT+HOME'."""
+    parts = spec.split("+")
+    name = parts[-1].strip().upper()
+    mods = [_MOD_VK[p.strip().upper()] for p in parts[:-1] if p.strip().upper() in _MOD_VK]
+    if name in _KEY_VK:
+        vk, ext = _KEY_VK[name]
+        inject_combo(mods, vk, ext)
+        return True
+    return False
+
 def inject_text(text):
     """Inject a string of text character by character."""
     for ch in text:
@@ -326,24 +375,15 @@ def dispatch(cmd: str):
             _inject_into_target(lambda: inject_backspace(n))
         except ValueError:
             pass
-    elif cmd == "KEY:ENTER":
-        _inject_into_target(lambda: inject_vk(VK_RETURN))
-    elif cmd == "KEY:TAB":
-        _inject_into_target(lambda: inject_vk(VK_TAB))
-    elif cmd == "KEY:DELETE":
-        _inject_into_target(lambda: inject_vk(VK_DELETE, extended=True))
-    elif cmd == "KEY:LEFT":
-        _inject_into_target(lambda: inject_vk(VK_LEFT, extended=True))
-    elif cmd == "KEY:RIGHT":
-        _inject_into_target(lambda: inject_vk(VK_RIGHT, extended=True))
-    elif cmd == "KEY:UP":
-        _inject_into_target(lambda: inject_vk(VK_UP, extended=True))
-    elif cmd == "KEY:DOWN":
-        _inject_into_target(lambda: inject_vk(VK_DOWN, extended=True))
-    elif cmd == "KEY:HOME":
-        _inject_into_target(lambda: inject_vk(VK_HOME, extended=True))
-    elif cmd == "KEY:END":
-        _inject_into_target(lambda: inject_vk(VK_END, extended=True))
+    elif cmd.startswith("KEY:"):
+        # Generic key spec with optional modifiers, e.g. KEY:ENTER, KEY:SHIFT+LEFT,
+        # KEY:CTRL+A, KEY:CTRL+SHIFT+HOME. Backward compatible with all old KEY:* names.
+        spec = cmd[4:]
+        parts = spec.split("+")
+        if parts[-1].strip().upper() in _KEY_VK:
+            _inject_into_target(lambda: inject_key_spec(spec))
+        else:
+            log(f"[key] unknown key spec: {spec!r}")
     elif cmd.startswith("CROP:"):
         arg = cmd[5:].strip()
         log(f"[crop] CROP command received: arg={arg!r}")
