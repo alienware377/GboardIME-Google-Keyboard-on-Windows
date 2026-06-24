@@ -237,8 +237,12 @@ public class MainActivity extends Activity {
             String text     = new String(decoded, "UTF-8");
             int    selStart = Integer.parseInt(payload.substring(c1 + 1, c2));
             int    selEnd   = Integer.parseInt(payload.substring(c2 + 1));
+            android.util.Log.d("RELAYSYNC", "SYNC len=" + text.length()
+                    + " sel=" + selStart + ":" + selEnd);
             inputField.syncFromHost(text, selStart, selEnd);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            android.util.Log.e("RELAYSYNC", "handleSync failed", e);
+        }
     }
 
     /** CURSOR:<sel_start>:<sel_end>
@@ -249,8 +253,11 @@ public class MainActivity extends Activity {
             if (colon < 0) return;
             int selStart = Integer.parseInt(payload.substring(0, colon));
             int selEnd   = Integer.parseInt(payload.substring(colon + 1));
+            android.util.Log.d("RELAYSYNC", "CURSOR sel=" + selStart + ":" + selEnd);
             inputField.setCursorFromHost(selStart, selEnd);
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            android.util.Log.e("RELAYSYNC", "handleCursor failed", e);
+        }
     }
 
     // ── UI helpers ───────────────────────────────────────────────────────────

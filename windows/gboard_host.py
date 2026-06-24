@@ -898,16 +898,19 @@ def _titlebar_thread():
 
 # ── Android bi-directional sync (host → relay app) ───────────────────────────
 
-def send_to_android(cmd: str):
-    """Write a newline-terminated command to the connected Android relay app."""
+def send_to_android(cmd: str) -> bool:
+    """Write a newline-terminated command to the connected Android relay app.
+    Returns True only if the bytes were actually handed to a live socket."""
     with _client_lock:
         conn = _client_conn
     if conn is None:
-        return
+        return False
     try:
         conn.sendall((cmd + "\n").encode("utf-8"))
+        return True
     except Exception as e:
         log(f"[sync] send_to_android error: {e}")
+        return False
 
 
 def _get_cursor_only(ctrl):
@@ -975,10 +978,20 @@ def _sync_field_to_android_thread():
         else:
             sel_start = sel_end = len(text)   # default: cursor at end
 
-        # 3. Send
+        # 3. Send. Retry briefly so a focus change that lands during the startup
+        #    connection handshake isn't silently dropped (SYNC is one-shot per field).
         text_b64 = base64.b64encode(text.encode("utf-8")).decode("ascii")
-        send_to_android(f"SYNC:{text_b64}:{sel_start}:{sel_end}")
-        log(f"[sync] SYNC sent: len={len(text)} sel={sel_start}:{sel_end}")
+        msg = f"SYNC:{text_b64}:{sel_start}:{sel_end}"
+        sent = False
+        for _ in range(10):
+            if send_to_android(msg):
+                sent = True
+                break
+            time.sleep(0.3)
+        if sent:
+            log(f"[sync] SYNC sent: len={len(text)} sel={sel_start}:{sel_end}")
+        else:
+            log(f"[sync] SYNC dropped (no client connected): len={len(text)}")
     except Exception as e:
         log(f"[sync] _sync_field_to_android_thread error: {e}")
     finally:
