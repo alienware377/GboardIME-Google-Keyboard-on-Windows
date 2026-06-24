@@ -392,6 +392,7 @@ def dispatch(cmd: str):
             # Arm a re-sync so Gboard's buffer follows the now-empty field.
             if keyname == "ENTER" and len(parts) == 1:
                 _arm_resync()
+                log("[resync] Enter received -> resync armed")
         else:
             log(f"[key] unknown key spec: {spec!r}")
     elif cmd.startswith("CROP:"):
@@ -913,14 +914,16 @@ def _titlebar_thread():
 _last_sync_key      = None   # owned by the focus watcher; module-level so Enter can reset it
 _resync_deadline    = 0.0    # wall-clock; while now < this, the watcher keeps trying to resync
 _resync_base_inject = 0.0    # _last_inject_time at Enter; cancels the resync if a newer inject appears
+_resync_log_count   = 0      # diagnostic: how many watcher ticks since last _arm_resync
 
-def _arm_resync(window=2.5):
+def _arm_resync(window=4.0):
     """Arm a one-shot field re-sync, retried for up to `window` seconds. Cancelled
     automatically if the user starts typing a NEW message before it fires (so it can
     never wipe in-progress text)."""
-    global _resync_deadline, _resync_base_inject
+    global _resync_deadline, _resync_base_inject, _resync_log_count
     _resync_base_inject = _last_inject_time
     _resync_deadline    = time.time() + window
+    _resync_log_count   = 0   # diagnostic: reset per-arm log counter
 
 def send_to_android(cmd: str) -> bool:
     """Write a newline-terminated command to the connected Android relay app.
@@ -959,6 +962,36 @@ def _get_cursor_only(ctrl):
     return None
 
 
+def _find_editable_descendant(ctrl, depth=6):
+    """Recursively search ctrl's descendants for an editable Edit/Document control.
+    Needed for Electron/Chromium apps (Discord, Slack, VS Code...) where UIA's
+    GetFocusedControl() returns a parent GroupControl/DocumentControl/PaneControl
+    instead of the actual textarea inside it, so _is_editable_focus(ctrl) is False
+    even though there IS an editable field in the subtree."""
+    if ctrl is None:
+        return None
+    try:
+        if _is_editable_focus(ctrl):
+            return ctrl
+    except Exception:
+        pass
+    if depth <= 0:
+        return None
+    try:
+        child = ctrl.GetFirstChildControl()
+    except Exception:
+        return None
+    while child is not None:
+        try:
+            found = _find_editable_descendant(child, depth - 1)
+            if found is not None:
+                return found
+            child = child.GetNextSiblingControl()
+        except Exception:
+            break
+    return None
+
+
 def _sync_field_to_android_thread():
     """Background thread: read the focused Windows field (text + cursor) and send
     SYNC to the Android relay app so Gboard's buffer matches the new field."""
@@ -970,6 +1003,13 @@ def _sync_field_to_android_thread():
         if fg and _is_emulator_window(fg):
             return
         ctrl = auto.GetFocusedControl()
+        if ctrl is not None and not _is_editable_focus(ctrl):
+            # Electron/Chromium fallback: focused element may be a GroupControl that
+            # WRAPS the actual textarea (some Electron apps do this, esp. after Enter).
+            inner = _find_editable_descendant(ctrl)
+            if inner is not None:
+                log(f"[sync] using editable descendant ({inner.ControlTypeName}) of focused {ctrl.ControlTypeName}")
+                ctrl = inner
         if ctrl is None or not _is_editable_focus(ctrl):
             return
 
@@ -1111,7 +1151,7 @@ def _focus_watcher():
     except Exception as e:
         log(f"[auto] uiautomation unavailable: {e!r}")
         return
-    global _last_sync_key, _resync_deadline
+    global _last_sync_key, _resync_deadline, _resync_log_count
     auto.SetGlobalSearchTimeout(0.5)
     log("[auto] focus watcher started")
     last_beat     = time.time()
@@ -1119,6 +1159,7 @@ def _focus_watcher():
                            # don't re-raise for the SAME field until focus moves away.
     _last_sync_key = None  # stable identity of the last field we sent SYNC for
     last_cursor    = None  # (sel_start, sel_end) of last CURSOR command sent
+    noned_start    = None  # when focus most recently became non-editable (re-entry detect)
     while True:
         # The ENTIRE body is guarded: a single uncaught exception here used to kill
         # the thread, silently disabling auto show/hide "after a while". Now it logs
@@ -1165,18 +1206,27 @@ def _focus_watcher():
             if suppress_sig is not None and sig != suppress_sig:
                 suppress_sig = None
 
+            now2 = time.time()
+            since_inject = now2 - _last_inject_time
+            # A new message typed since Enter cancels the pending Enter-resync,
+            # so it can never clobber text the user is now building.
+            if _resync_deadline and _last_inject_time > _resync_base_inject + 0.05:
+                _resync_deadline = 0.0
+            resync_armed = _resync_deadline and now2 < _resync_deadline
+
             if editable:
                 if not shown and sig != suppress_sig:
                     show_emulator(manual=False)
                 # ── Android buffer sync ─────────────────────────────────────
                 skey = _sync_key(fg, ctrl)
-                now2 = time.time()
-                since_inject = now2 - _last_inject_time
-                # A new message typed since Enter cancels the pending Enter-resync,
-                # so it can never clobber text the user is now building.
-                if _resync_deadline and _last_inject_time > _resync_base_inject + 0.05:
-                    _resync_deadline = 0.0
-                resync_armed = _resync_deadline and now2 < _resync_deadline
+
+                # Re-entry: if focus had genuinely left an editable field (non-editable
+                # for >0.6s — long enough to not be a transient UIA/keyboard blip) and
+                # has now returned, force a fresh SYNC even if it's the SAME field. This
+                # is the "clicked back into the box" case the user wants synced.
+                if noned_start is not None and (now2 - noned_start) > 0.6:
+                    _last_sync_key = None
+                noned_start = None
 
                 if resync_armed and since_inject > 0.4:
                     # Enter-resync: the box has settled (~0.4s past the Enter inject)
@@ -1185,14 +1235,18 @@ def _focus_watcher():
                     _resync_deadline = 0.0
                     _last_sync_key = skey
                     last_cursor    = None
+                    log(f"[resync] FIRED editable since_inject={since_inject:.2f}")
                     threading.Thread(
                         target=_sync_field_to_android_thread, daemon=True).start()
+                elif resync_armed:
+                    _resync_log_count += 1
+                    if _resync_log_count <= 3:
+                        log(f"[resync] tick editable={editable} since_inject={since_inject:.2f} skey={'same' if skey == _last_sync_key else 'NEW'}")
                 elif skey is not None and skey != _last_sync_key:
-                    # Genuinely a DIFFERENT field. Only push a fresh SYNC once the
-                    # relay has been quiet for >1s — otherwise a field switch right
-                    # after typing (or a stray re-focus mid-glide) would setText()
-                    # over the buffer the user is still building. If the guard is
-                    # active we leave _last_sync_key unchanged so it retries next tick.
+                    # Genuinely a DIFFERENT field (or a forced re-entry). Only push a
+                    # fresh SYNC once the relay has been quiet for >1s — otherwise a
+                    # field switch right after typing (or a stray re-focus mid-glide)
+                    # would setText() over the buffer the user is still building.
                     if since_inject > 1.0:
                         _last_sync_key = skey
                         last_cursor    = None
@@ -1210,13 +1264,42 @@ def _focus_watcher():
                     except Exception:
                         pass
             else:
+                # Resync-armed-and-focus-non-editable. Two sub-cases:
+                # (a) focused ctrl has an editable descendant (rare; Electron usually
+                #     doesn't expose its textarea as Edit/Document) — sync via it.
+                # (b) focused ctrl is a wrapper that UIA classifies as TextControl/
+                #     GroupControl with TextPattern only (many Electron chat apps).
+                #     The wrapper itself yields text="" via the normal sync path, which
+                #     is correct for the chat-clear case the user wants. So just FIRE.
+                if resync_armed and since_inject > 0.4 and ctrl is not None:
+                    inner = _find_editable_descendant(ctrl)
+                    _resync_deadline = 0.0
+                    if inner is not None:
+                        _last_sync_key = _sync_key(fg, inner)
+                        log(f"[resync] FIRED via descendant ({inner.ControlTypeName})")
+                    else:
+                        # Best-effort: chat-clear case. Send CLEAR so Gboard's buffer
+                        # blanks even though we can't precisely read the wrapped textarea.
+                        send_to_android("CLEAR")
+                        log(f"[resync] FIRED via CLEAR fallback (ctrl={ctrl.ControlTypeName})")
+                    last_cursor = None
+                    if inner is not None:
+                        threading.Thread(
+                            target=_sync_field_to_android_thread, daemon=True).start()
                 # Only auto-hide a keyboard that auto raised — never a manual one.
                 if shown and _auto_shown:
                     hide_emulator()
-                # NOTE: do NOT clear last_sync_key on a non-editable blip. Focus
-                # briefly bounces off the field while the keyboard shows/hides; if we
-                # reset here, returning to the SAME field would re-SYNC and wipe the
-                # buffer. The key only changes when focus lands on a truly new field.
+                # Mark when focus left an editable field, so a genuine return (not a
+                # sub-0.6s blip) forces a re-sync above.
+                if noned_start is None:
+                    noned_start = time.time()
+                if resync_armed:
+                    _resync_log_count += 1
+                    if _resync_log_count <= 3:
+                        ctn = None
+                        try: ctn = ctrl.ControlTypeName if ctrl else None
+                        except Exception: pass
+                        log(f"[resync] tick NOT editable ctrl={ctn} since_inject={since_inject:.2f}")
         except Exception as e:
             log(f"[auto] watcher loop error (continuing): {e!r}")
             time.sleep(0.5)
