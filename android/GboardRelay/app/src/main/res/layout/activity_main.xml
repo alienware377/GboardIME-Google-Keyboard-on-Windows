@@ -1,44 +1,69 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="#263238"
-    android:fitsSystemWindows="false"
-    android:gravity="center_horizontal|top"
-    android:padding="0dp">
+    android:fitsSystemWindows="false">
 
-    <TextView
-        android:id="@+id/title_text"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="⌨ Gboard → Windows Relay"
-        android:textColor="#90CAF9"
-        android:textSize="14sp"
-        android:visibility="gone"/>
-
-    <TextView
-        android:id="@+id/status_text"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Connecting..."
-        android:textColor="#FF8A65"
-        android:textSize="11sp"
-        android:visibility="gone"/>
-
-    <com.gboardrelay.RelayEditText
-        android:id="@+id/input_field"
+    <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:gravity="top"
-        android:hint="Type here with Gboard — text goes to Windows"
-        android:textColor="#FFFFFF"
-        android:textColorHint="#607D8B"
-        android:textSize="14sp"
-        android:background="#263238"
-        android:padding="8dp"
-        android:inputType="textMultiLine"
-        android:imeOptions="flagNoEnterAction|flagNoFullscreen|flagNoExtractUi"/>
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:gravity="center_horizontal|top"
+        android:padding="0dp">
 
-</LinearLayout>
+        <TextView
+            android:id="@+id/title_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="⌨ Gboard → Windows Relay"
+            android:textColor="#90CAF9"
+            android:textSize="14sp"
+            android:visibility="gone"/>
+
+        <TextView
+            android:id="@+id/status_text"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Connecting..."
+            android:textColor="#FF8A65"
+            android:textSize="11sp"
+            android:visibility="gone"/>
+
+        <com.gboardrelay.RelayEditText
+            android:id="@+id/input_field"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:gravity="top"
+            android:hint="Type here with Gboard — text goes to Windows"
+            android:textColor="#FFFFFF"
+            android:textColorHint="#607D8B"
+            android:textSize="14sp"
+            android:background="#263238"
+            android:padding="8dp"
+            android:inputType="textMultiLine"
+            android:imeOptions="flagNoEnterAction|flagNoFullscreen|flagNoExtractUi"/>
+
+    </LinearLayout>
+
+    <!-- Small exit-kiosk toggle, floats top-right over the input area. Tapping it
+         leaves Lock Task / kiosk mode so Home, Recents, and gesture-nav work again
+         (and the app can be left). Tapping again re-enters kiosk. -->
+    <TextView
+        android:id="@+id/exit_kiosk_btn"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="2dp"
+        android:layout_marginEnd="6dp"
+        android:text="⏏"
+        android:textColor="#90A4AE"
+        android:textSize="16sp"
+        android:paddingLeft="10dp"
+        android:paddingRight="10dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:background="#33000000"/>
+
+</FrameLayout>

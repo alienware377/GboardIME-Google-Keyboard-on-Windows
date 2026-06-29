@@ -772,7 +772,8 @@ def _titlebar_thread():
     # process is per-monitor DPI aware). Default 2.0 for this 200% display.
     hwnd0 = _find_emulator_hwnd()
     scale = _window_scale(hwnd0) if hwnd0 else 2.0
-    BAR_H  = max(28, int(round(24 * scale)))     # thicker bar
+    BAR_H  = max(28, int(round(24 * scale)))     # thicker bottom bar
+    TOP_H  = max(14, int(round(12 * scale)))     # thinner blank top handle
     FONT_PX = max(10, int(round(10 * scale)))
     RADIUS = max(8,  int(round(11 * scale)))     # rounded top-corner radius
 
@@ -837,6 +838,34 @@ def _titlebar_thread():
         drag["ex"], drag["ey"] = wr.left, wr.top
         drag["hwnd"] = h
 
+    # A thin BLANK handle glued to the TOP edge of the emulator, so the window can
+    # also be dragged from above (mirrors the bottom bar). No label, no buttons.
+    top = tk.Toplevel(root)
+    top.overrideredirect(True)
+    top.attributes("-topmost", True)
+    top.configure(bg=_BAR_BG)
+    top.withdraw()
+    top_hwnd = [0]
+
+    def _stamp_top():
+        h = top.winfo_id()
+        p = u.GetParent(h)
+        target = p if p else h
+        ex = _GetWindowLongPtr(target, GWL_EXSTYLE)
+        ex |= WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+        ex &= ~WS_EX_APPWINDOW
+        _SetWindowLongPtr(target, GWL_EXSTYLE, ex)
+        return target
+
+    # Subtle centered grip so it reads as a draggable handle despite being blank.
+    grip = tk.Label(top, text="•••", bg=_BAR_BG, fg="#6a6a6a",
+                    font=("Segoe UI", max(7, int(round(7 * scale)))))
+    grip.place(relx=0.5, rely=0.5, anchor="center")
+    def _top_enter(_): top.configure(bg=_BAR_BG_HOT); grip.configure(bg=_BAR_BG_HOT)
+    def _top_leave(_): top.configure(bg=_BAR_BG);     grip.configure(bg=_BAR_BG)
+    top.bind("<Enter>", _top_enter)
+    top.bind("<Leave>", _top_leave)
+
     def _on_drag_move(_):
         h = drag["hwnd"]
         if not h:
@@ -844,15 +873,19 @@ def _titlebar_thread():
         cx, cy = _cursor()
         nx = drag["ex"] + (cx - drag["cx"])
         ny = drag["ey"] + (cy - drag["cy"])
-        # Move the emulator; the sync loop reglues the bar above it. Move the bar
-        # immediately too so it tracks the cursor without a 1-tick lag.
+        # Move the emulator; the sync loop reglues both handles. Move them immediately
+        # too so they track the cursor without a 1-tick lag.
         _SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(HWND_TOPMOST),
                       nx, ny, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
         wr = _RECT(); _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr))
         w = wr.right - wr.left
         root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom}")
+        top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
 
     for w in (title, container):
+        w.bind("<Button-1>", _on_drag_start)
+        w.bind("<B1-Motion>", _on_drag_move)
+    for w in (top, grip):
         w.bind("<Button-1>", _on_drag_start)
         w.bind("<B1-Motion>", _on_drag_move)
 
@@ -873,23 +906,29 @@ def _titlebar_thread():
                 wr = _RECT(); _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr))
                 w = wr.right - wr.left
                 root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom}")
+                top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
                 if state["shown"] is not True:
                     root.deiconify()
+                    top.deiconify()
                     if not bar_hwnd[0]:
                         bar_hwnd[0] = _stamp_bar()
+                    if not top_hwnd[0]:
+                        top_hwnd[0] = _stamp_top()
                     state["shown"] = True
                     state["rw"] = 0          # force region re-apply after re-show
                 if bar_hwnd[0] and w != state["rw"]:
                     _round_bottom(bar_hwnd[0], w)
                     state["rw"] = w
                 # Re-assert topmost above the emulator without activating.
-                if bar_hwnd[0]:
-                    _SetWindowPos(ctypes.c_void_p(bar_hwnd[0]),
-                                  ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
-                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                for bh in (bar_hwnd[0], top_hwnd[0]):
+                    if bh:
+                        _SetWindowPos(ctypes.c_void_p(bh),
+                                      ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
             else:
                 if state["shown"] is not False:
                     root.withdraw()
+                    top.withdraw()
                     state["shown"] = False
         except Exception as e:
             log(f"[titlebar] sync error: {e}")
@@ -942,10 +981,12 @@ def send_to_android(cmd: str) -> bool:
 
 def _get_cursor_only(ctrl):
     """Return (sel_start, sel_end) char offsets from a UIA control, or None.
-    Tries EM_GETSEL first (fast, cross-process safe for Win32 Edit controls).
-    Returns None for controls that don't expose their cursor this way."""
+    Tries EM_GETSEL first (fast, cross-process safe for Win32 Edit controls),
+    then falls back to the UIA TextPattern selection (rich-text / WPF / many
+    framework editors that don't answer EM_GETSEL). Returns None if neither works."""
     if ctrl is None:
         return None
+    # Fast path: classic Win32 Edit control.
     try:
         hwnd = ctrl.NativeWindowHandle
         if hwnd:
@@ -957,6 +998,23 @@ def _get_cursor_only(ctrl):
                 s = ret_u & 0xFFFF
                 e = (ret_u >> 16) & 0xFFFF
                 return (s, e)
+    except Exception:
+        pass
+    # Fallback: UIA TextPattern selection -> char offsets from the document start.
+    try:
+        tp = ctrl.GetTextPattern()
+        if tp is not None:
+            sel = tp.GetSelection()
+            if sel and len(sel) > 0:
+                rng = sel[0]
+                doc = tp.DocumentRange
+                # endpoint ids: Start=0, End=1. Build [docStart .. rng.Start] and
+                # [docStart .. rng.End]; their text lengths are the char offsets.
+                a = doc.Clone(); a.MoveEndpointByRange(1, rng, 0)
+                start = len(a.GetText(-1))
+                b = doc.Clone(); b.MoveEndpointByRange(1, rng, 1)
+                end = len(b.GetText(-1))
+                return (start, end)
     except Exception:
         pass
     return None

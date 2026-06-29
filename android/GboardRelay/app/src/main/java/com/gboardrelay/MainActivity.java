@@ -67,6 +67,8 @@ public class MainActivity extends Activity {
         inputField = findViewById(R.id.input_field);
         statusText = findViewById(R.id.status_text);
         titleText  = findViewById(R.id.title_text);
+        TextView exitKioskBtn = findViewById(R.id.exit_kiosk_btn);
+        exitKioskBtn.setOnClickListener(v -> toggleKiosk(exitKioskBtn));
         mainHandler = new Handler(Looper.getMainLooper());
         ioExecutor = Executors.newCachedThreadPool();
         sendExecutor = Executors.newSingleThreadExecutor();
@@ -103,6 +105,45 @@ public class MainActivity extends Activity {
             }
         } catch (Exception ignored) {
             // Not provisioned as Device Owner — keyboard still works normally.
+        }
+    }
+
+    /** Tracks whether we're currently pinned in Lock Task mode (only meaningful when
+     *  Device Owner). Toggled by the on-screen eject button. */
+    private boolean kioskActive = true;
+
+    /** Toggle Lock Task (kiosk) mode from the on-screen eject button. Exiting lets
+     *  Home / Recents / gesture-nav work again so the user can leave the app or move
+     *  it; tapping again re-pins it. No-op (other than the toast) if we're not the
+     *  Device Owner, since Lock Task was never engaged. */
+    private void toggleKiosk(TextView btn) {
+        try {
+            DevicePolicyManager dpm =
+                    (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+            boolean owner = dpm != null && dpm.isDeviceOwnerApp(getPackageName());
+            if (kioskActive) {
+                try { stopLockTask(); } catch (Exception ignored) {}
+                kioskActive = false;
+                btn.setText("⏏");
+                btn.setAlpha(0.5f);
+                android.widget.Toast.makeText(this,
+                        owner ? "Kiosk off — Home/Recents enabled"
+                              : "Not in kiosk mode (not Device Owner)",
+                        android.widget.Toast.LENGTH_SHORT).show();
+            } else {
+                if (owner && dpm.isLockTaskPermitted(getPackageName())) {
+                    startLockTask();
+                }
+                kioskActive = true;
+                btn.setText("⏏");
+                btn.setAlpha(1.0f);
+                android.widget.Toast.makeText(this,
+                        owner ? "Kiosk on — locked to foreground"
+                              : "Not Device Owner — cannot lock",
+                        android.widget.Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) {
+            android.util.Log.e("RELAYKIOSK", "toggleKiosk failed", e);
         }
     }
 

@@ -299,19 +299,29 @@ public class RelayEditText extends EditText {
 
             @Override
             public boolean setSelection(int start, int end) {
-                Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled);
-                // Gboard's panel "jump to start" (|<) and "jump to end" (>|) buttons move
-                // the cursor via setSelection, not a key event. Forward those as
-                // Ctrl+Home / Ctrl+End. Guard hard against false positives: only when the
-                // change is NOT from our own text mutation (icHandled), the cursor is
-                // collapsed, AND it jumped to an absolute boundary by more than one
-                // position (so per-keystroke cursor advances never trigger it).
-                if (!icHandled && start == end) {
+                // The relay field's cursor is always mirrored to Windows (we relay every
+                // edit + nav key), so getSelectionStart() BEFORE this call is exactly
+                // where the Windows caret is. A collapsed setSelection that did NOT come
+                // from our own mutation (icHandled) and is NOT inside an active composing
+                // word is a pure cursor MOVE: Gboard's editing-panel arrows, the |< / >|
+                // jump buttons, OR the swipe-the-spacebar-to-move-cursor gesture. Forward
+                // the delta to Windows as the matching arrow presses so both carets track.
+                int curPos = getSelectionStart();   // current cursor == Windows caret
+                Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled
+                        + " from=" + curPos + " composing=" + composing);
+                if (!icHandled && start == end && composing.isEmpty()) {
                     int len = getText() != null ? getText().length() : 0;
-                    int curPos = getSelectionStart();   // real cursor BEFORE the jump
-                    if (Math.abs(start - curPos) > 1) {
-                        if (start <= 0)        send("KEY:CTRL+HOME");
-                        else if (start >= len) send("KEY:CTRL+END");
+                    int delta = start - curPos;
+                    if (delta != 0) {
+                        if (start <= 0 && curPos > 1) {
+                            send("KEY:CTRL+HOME");          // jump to very start (1 key)
+                        } else if (start >= len && (len - curPos) > 1) {
+                            send("KEY:CTRL+END");            // jump to very end (1 key)
+                        } else if (delta > 0) {
+                            for (int i = 0; i < delta; i++)  send("KEY:RIGHT");
+                        } else {
+                            for (int i = 0; i < -delta; i++) send("KEY:LEFT");
+                        }
                     }
                 }
                 return super.setSelection(start, end);
