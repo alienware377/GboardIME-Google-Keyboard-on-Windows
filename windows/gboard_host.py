@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import os
+import winreg
 
 import base64
 
@@ -1456,6 +1457,54 @@ def hotkey_thread():
         if msg.message == WM_HOTKEY and msg.wParam == 1:
             toggle_emulator()
 
+# ── Start-at-boot (HKCU Run key) ─────────────────────────────────────────────
+# A login Run entry that launches the whole stack (emulator + relay + host) by
+# running launch.ps1 hidden. Toggled from the tray; "checked" reflects whether the
+# value is currently present.
+_RUN_KEY  = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "GboardIME"
+
+def _autostart_cmd():
+    # repo root = parent of this file's windows\ dir; launch.ps1 lives there.
+    root   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    launch = os.path.join(root, "launch.ps1")
+    return ('powershell.exe -NoProfile -ExecutionPolicy Bypass '
+            f'-WindowStyle Hidden -File "{launch}"')
+
+def _autostart_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, _RUN_NAME)
+            return bool(val)
+    except OSError:
+        return False
+
+def _set_autostart(enable):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                        winreg.KEY_SET_VALUE) as k:
+        if enable:
+            winreg.SetValueEx(k, _RUN_NAME, 0, winreg.REG_SZ, _autostart_cmd())
+        else:
+            try:
+                winreg.DeleteValue(k, _RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+# Keyboard sizes (height aspect-locked at width x 1.25). The four named anchors plus
+# six interpolated steps between them, evenly spaced, for finer control.
+_SIZES = [
+    ("Small  (300)", 300, 375),
+    ("327",          327, 409),
+    ("353",          353, 441),
+    ("Medium (380)", 380, 475),
+    ("407",          407, 509),
+    ("433",          433, 541),
+    ("Large  (460)", 460, 575),
+    ("493",          493, 616),
+    ("527",          527, 659),
+    ("XLarge (560)", 560, 700),
+]
+
 # ── System tray icon ─────────────────────────────────────────────────────────
 def _make_icon_image():
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -1476,8 +1525,19 @@ def run_tray():
         print(f"[GboardHost] Auto show/hide = {_auto_mode}")
     def auto_checked(item):     return _auto_mode
 
+    def on_boot(icon, item):
+        try:
+            _set_autostart(not _autostart_enabled())
+        except Exception as e:
+            log(f"[tray] start-at-boot toggle failed: {e}")
+    def boot_checked(item):     return _autostart_enabled()
+
     def size_action(w, h):
         return lambda icon, item: _set_size(w, h)
+
+    size_menu = pystray.Menu(*[
+        pystray.MenuItem(label, size_action(w, h)) for (label, w, h) in _SIZES
+    ])
 
     icon = pystray.Icon(
         "GboardIME",
@@ -1486,13 +1546,9 @@ def run_tray():
         menu=pystray.Menu(
             pystray.MenuItem("Toggle keyboard  [Ctrl+Alt+K]", on_toggle, default=True),
             pystray.MenuItem("Auto show/hide", on_auto, checked=auto_checked),
+            pystray.MenuItem("Start at boot",  on_boot, checked=boot_checked),
             pystray.MenuItem("Dock to bottom-right",          on_dock),
-            pystray.MenuItem("Keyboard size", pystray.Menu(
-                pystray.MenuItem("Small",  size_action(300, 375)),
-                pystray.MenuItem("Medium", size_action(380, 475)),
-                pystray.MenuItem("Large",  size_action(460, 575)),
-                pystray.MenuItem("XLarge", size_action(560, 700)),
-            )),
+            pystray.MenuItem("Keyboard size", size_menu),
             pystray.MenuItem("Re-apply ADB reverse",          on_adb),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit",                           on_quit),
