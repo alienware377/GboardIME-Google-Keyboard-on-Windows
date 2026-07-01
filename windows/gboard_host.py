@@ -269,13 +269,24 @@ _KEY_VK = {
 _MOD_VK = {"SHIFT": VK_SHIFT, "CTRL": VK_CONTROL, "CONTROL": VK_CONTROL, "ALT": VK_MENU}
 
 def inject_key_spec(spec):
-    """spec like 'LEFT', 'SHIFT+LEFT', 'CTRL+A', 'CTRL+SHIFT+HOME'."""
+    """spec like 'LEFT', 'SHIFT+LEFT', 'CTRL+A', 'CTRL+SHIFT+HOME', optionally with a
+    trailing repeat count on the key: 'LEFT*5', 'SHIFT+RIGHT*3'. The repeat lets a
+    multi-char caret move be sent as one command instead of N separate ones."""
     parts = spec.split("+")
     name = parts[-1].strip().upper()
+    repeat = 1
+    if "*" in name:
+        name, _, cnt = name.partition("*")
+        name = name.strip()
+        try:
+            repeat = max(1, min(1000, int(cnt.strip())))
+        except ValueError:
+            repeat = 1
     mods = [_MOD_VK[p.strip().upper()] for p in parts[:-1] if p.strip().upper() in _MOD_VK]
     if name in _KEY_VK:
         vk, ext = _KEY_VK[name]
-        inject_combo(mods, vk, ext)
+        for _ in range(repeat):
+            inject_combo(mods, vk, ext)
         return True
     return False
 
@@ -387,11 +398,12 @@ def dispatch(cmd: str):
         spec = cmd[4:]
         parts = spec.split("+")
         keyname = parts[-1].strip().upper()
-        if keyname in _KEY_VK:
+        base = keyname.split("*")[0].strip()   # strip any '*N' repeat suffix
+        if base in _KEY_VK:
             _inject_into_target(lambda: inject_key_spec(spec))
             # A bare Enter often submits a chat message and blanks the input box.
             # Arm a re-sync so Gboard's buffer follows the now-empty field.
-            if keyname == "ENTER" and len(parts) == 1:
+            if base == "ENTER" and len(parts) == 1:
                 _arm_resync()
                 log("[resync] Enter received -> resync armed")
         else:

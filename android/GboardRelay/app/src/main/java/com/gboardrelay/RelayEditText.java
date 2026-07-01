@@ -299,30 +299,25 @@ public class RelayEditText extends EditText {
 
             @Override
             public boolean setSelection(int start, int end) {
-                // The relay field's cursor is always mirrored to Windows (we relay every
-                // edit + nav key), so getSelectionStart() BEFORE this call is exactly
-                // where the Windows caret is. A collapsed setSelection that did NOT come
-                // from our own mutation (icHandled) and is NOT inside an active composing
-                // word is a pure cursor MOVE: Gboard's editing-panel arrows, the |< / >|
-                // jump buttons, OR the swipe-the-spacebar-to-move-cursor gesture. Forward
-                // the delta to Windows as the matching arrow presses so both carets track.
-                int curPos = getSelectionStart();   // current cursor == Windows caret
+                // CRITICAL for keeping the two buffers aligned: super.setSelection ALWAYS
+                // moves the relay field's caret. If we don't mirror that same move to the
+                // Windows caret, the two drift apart and every later word lands in the
+                // wrong place (the "findcan you" vs "can youfind" scramble). So whenever
+                // Gboard moves the caret (NOT one of our own mutations, icHandled), we
+                // forward the EXACT delta as arrow presses. The delta is RELATIVE, so it
+                // stays correct even after the relay buffer is trimmed (unlike absolute
+                // Ctrl+Home/End). We batch with '*N' so a big jump is a single command.
+                // This covers arrows, the |< / >| jump buttons, tap-to-position, AND the
+                // swipe-the-spacebar-to-move-cursor gesture. No composing guard: Gboard
+                // routes typing-time caret advances through commit/compose (which never
+                // call this override), so a setSelection here is always a real move.
+                int curPos = getSelectionStart();   // relay caret == Windows caret (invariant)
                 Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled
                         + " from=" + curPos + " composing=" + composing);
-                if (!icHandled && start == end && composing.isEmpty()) {
-                    int len = getText() != null ? getText().length() : 0;
+                if (!icHandled && start == end) {
                     int delta = start - curPos;
-                    if (delta != 0) {
-                        if (start <= 0 && curPos > 1) {
-                            send("KEY:CTRL+HOME");          // jump to very start (1 key)
-                        } else if (start >= len && (len - curPos) > 1) {
-                            send("KEY:CTRL+END");            // jump to very end (1 key)
-                        } else if (delta > 0) {
-                            for (int i = 0; i < delta; i++)  send("KEY:RIGHT");
-                        } else {
-                            for (int i = 0; i < -delta; i++) send("KEY:LEFT");
-                        }
-                    }
+                    if (delta > 0)      send("KEY:RIGHT*" + delta);
+                    else if (delta < 0) send("KEY:LEFT*"  + (-delta));
                 }
                 return super.setSelection(start, end);
             }
