@@ -60,8 +60,12 @@ public class MainActivity extends Activity {
         // above the box. Must run before/with hideSystemBars().
         final int SLATE = 0xFF263238;
         getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(SLATE));
-        getWindow().setStatusBarColor(android.graphics.Color.TRANSPARENT);
-        getWindow().setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+        // Colour the bars SLATE (not transparent): in Lock Task / kiosk mode the system
+        // keeps a status bar on screen and the app's immersive hide doesn't always stick,
+        // so a transparent bar shows as a black band. Slate makes it blend with the input
+        // field, so there's no visible black bar even when the bar is forced on.
+        getWindow().setStatusBarColor(SLATE);
+        getWindow().setNavigationBarColor(SLATE);
         hideSystemBars();   // after setContentView: needs the decor view / insets controller
 
         inputField = findViewById(R.id.input_field);
@@ -96,6 +100,11 @@ public class MainActivity extends Activity {
             ComponentName admin = new ComponentName(this, RelayAdminReceiver.class);
             if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
                 dpm.setLockTaskPackages(admin, new String[]{ getPackageName() });
+                // Minimal system UI in kiosk (no notifications / quick settings). The
+                // status bar may still be drawn, but we colour it slate above so it's
+                // not a visible black band.
+                try { dpm.setLockTaskFeatures(admin,
+                        DevicePolicyManager.LOCK_TASK_FEATURE_NONE); } catch (Exception ignored2) {}
             }
             // startLockTask() works when the package is lock-task-whitelisted (above);
             // otherwise it falls back to screen-pinning (which shows a confirm dialog),

@@ -993,10 +993,11 @@ def send_to_android(cmd: str) -> bool:
 
 
 def _get_cursor_only(ctrl):
-    """Return (sel_start, sel_end) char offsets from a UIA control, or None.
+    """Return (sel_start, sel_end, text_len) char offsets from a UIA control, or None.
     Tries EM_GETSEL first (fast, cross-process safe for Win32 Edit controls),
     then falls back to the UIA TextPattern selection (rich-text / WPF / many
-    framework editors that don't answer EM_GETSEL). Returns None if neither works."""
+    framework editors that don't answer EM_GETSEL). text_len lets callers tell a
+    genuine backward reposition (caret < end) from the normal at-end typing state."""
     if ctrl is None:
         return None
     # Fast path: classic Win32 Edit control.
@@ -1004,13 +1005,16 @@ def _get_cursor_only(ctrl):
         hwnd = ctrl.NativeWindowHandle
         if hwnd:
             EM_GETSEL = 0x00B0
+            WM_GETTEXTLENGTH = 0x000E
             ret = ctypes.windll.user32.SendMessageW(
                 ctypes.c_void_p(hwnd), EM_GETSEL, 0, 0)
             ret_u = ret & 0xFFFFFFFF          # treat as unsigned 32-bit
             if ret_u != 0xFFFFFFFF:           # 0xFFFF_FFFF = selection too large
                 s = ret_u & 0xFFFF
                 e = (ret_u >> 16) & 0xFFFF
-                return (s, e)
+                tlen = ctypes.windll.user32.SendMessageW(
+                    ctypes.c_void_p(hwnd), WM_GETTEXTLENGTH, 0, 0) & 0x7FFFFFFF
+                return (s, e, tlen)
     except Exception:
         pass
     # Fallback: UIA TextPattern selection -> char offsets from the document start.
@@ -1027,10 +1031,354 @@ def _get_cursor_only(ctrl):
                 start = len(a.GetText(-1))
                 b = doc.Clone(); b.MoveEndpointByRange(1, rng, 1)
                 end = len(b.GetText(-1))
-                return (start, end)
+                total = len(doc.GetText(-1))
+                return (start, end, total)
     except Exception:
         pass
     return None
+
+
+def _click_watch_thread():
+    """Keep the relay aligned when the user repositions the Windows caret by MOUSE /
+    TOUCH click. Reading the exact caret offset back from the app was the obvious
+    approach, but for Electron/Chromium apps (Discord, Slack, VS Code) UIA text
+    access is both ~1 s slow AND returns offsets measured against the whole page, not
+    the field — unusable. So instead of moving the relay caret we RESET the relay
+    buffer on a click: the next thing typed then inserts at wherever the Windows caret
+    now is, so words never jumble after you click an earlier word to fix it.
+
+    Detection is instant and UIA-free: poll the async left-button state (~30 ms) and
+    fire on button-release. Guards so it only fires on a real reposition click:
+      * keyboard must be up and the foreground must NOT be the emulator;
+      * it must be a CLICK, not a drag (release within a few px of the press) — this
+        excludes window-handle drags and text-selection drags;
+      * >0.3 s since our own last keystroke (don't fire mid-typing burst);
+      * debounced to at most once per 0.4 s.
+    CLEAR only resets the Android relay's local buffer; it never touches Windows text.
+    """
+    u = ctypes.windll.user32
+    u.WindowFromPoint.restype  = ctypes.c_void_p
+    u.WindowFromPoint.argtypes = [_POINT]
+    u.GetAncestor.restype  = ctypes.c_void_p
+    u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+
+    def _cls(hwnd):
+        try:
+            b = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(ctypes.c_void_p(hwnd), b, 64)
+            return b.value
+        except Exception:
+            return ""
+
+    log("[click] click-watch thread started")
+    prev_down = False
+    last_clear = 0.0
+    while True:
+        try:
+            time.sleep(0.02)
+            down = bool(u.GetAsyncKeyState(0x01) & 0x8000)   # VK_LBUTTON (mouse)
+            if down and not prev_down:                        # press = act immediately
+                now = time.time()
+                emu = _find_emulator_hwnd()
+                pt = _POINT(); u.GetCursorPos(ctypes.byref(pt))
+                h = u.WindowFromPoint(pt)
+                root = u.GetAncestor(h, 2) if h else None     # GA_ROOT
+                cls = _cls(root) if root else ""
+                # Skip clicks on the emulator itself or our own Tk drag handles — those
+                # are keyboard/handle interactions, not a text-field reposition. Don't
+                # require the keyboard to be visible: clearing an unused relay is
+                # harmless and it may be momentarily hidden when you reach over to click.
+                on_emu = (emu and root == emu) or cls.startswith("Tk") \
+                         or cls.startswith("Qt")
+                ok = (not on_emu and now - last_clear > 0.4)
+                if ok:
+                    send_to_android("CLEAR")
+                    last_clear = now
+                    log(f"[click] CLEAR on mouse click (cls={cls!r})")
+            prev_down = down
+
+            # (Touch-tap reposition CLEAR is disabled — see _touch_watch_thread note.
+            #  The mouse click path above is the reliable reposition trigger.)
+        except Exception as e:
+            log(f"[click] watch error (continuing): {e!r}")
+            time.sleep(0.3)
+
+
+# ── Global touch-tap detection (Raw Input from the HID digitizer) ─────────────
+# Chromium/Electron consumes touch as pointer input and emits NO mouse events, so
+# the mouse click-watcher above never sees touch taps. To catch them we register a
+# raw-input SINK for the touchscreen (HID usage page 0x0D / usage 0x04), parse each
+# report for the contact's X/Y, map it to the screen, and — if the tap did NOT land
+# on the emulator window — treat it as a Windows caret reposition and CLEAR the relay
+# (same as a mouse click). Landing ON the emulator means it's a Gboard key/swipe, so
+# we ignore it. All UIA-free and fast.
+from ctypes import wintypes as _wt
+
+_RID_INPUT           = 0x10000003
+_RIDI_PREPARSEDDATA  = 0x20000005
+_RIDEV_INPUTSINK     = 0x00000100
+_RIM_TYPEHID         = 2
+_WM_INPUT            = 0x00FF
+_HIDP_Input          = 0
+_HIDP_STATUS_SUCCESS = 0x00110000
+
+class _RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", _wt.USHORT), ("usUsage", _wt.USHORT),
+                ("dwFlags", _wt.DWORD), ("hwndTarget", _wt.HWND)]
+
+class _RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", _wt.DWORD), ("dwSize", _wt.DWORD),
+                ("hDevice", _wt.HANDLE), ("wParam", _wt.WPARAM)]
+
+class _HIDP_CAPS(ctypes.Structure):
+    _fields_ = [("Usage", _wt.USHORT), ("UsagePage", _wt.USHORT),
+                ("InputReportByteLength", _wt.USHORT),
+                ("OutputReportByteLength", _wt.USHORT),
+                ("FeatureReportByteLength", _wt.USHORT),
+                ("Reserved", _wt.USHORT * 17),
+                ("NumberLinkCollectionNodes", _wt.USHORT),
+                ("NumberInputButtonCaps", _wt.USHORT),
+                ("NumberInputValueCaps", _wt.USHORT),
+                ("NumberInputDataIndices", _wt.USHORT),
+                ("NumberOutputButtonCaps", _wt.USHORT),
+                ("NumberOutputValueCaps", _wt.USHORT),
+                ("NumberOutputDataIndices", _wt.USHORT),
+                ("NumberFeatureButtonCaps", _wt.USHORT),
+                ("NumberFeatureValueCaps", _wt.USHORT),
+                ("NumberFeatureDataIndices", _wt.USHORT)]
+
+class _HIDP_VALUE_CAPS(ctypes.Structure):
+    _fields_ = [("UsagePage", _wt.USHORT), ("ReportID", ctypes.c_ubyte),
+                ("IsAlias", ctypes.c_ubyte), ("BitField", _wt.USHORT),
+                ("LinkCollection", _wt.USHORT), ("LinkUsage", _wt.USHORT),
+                ("LinkUsagePage", _wt.USHORT), ("IsRange", ctypes.c_ubyte),
+                ("IsStringRange", ctypes.c_ubyte), ("IsDesignatorRange", ctypes.c_ubyte),
+                ("IsAbsolute", ctypes.c_ubyte), ("HasNull", ctypes.c_ubyte),
+                ("Reserved", ctypes.c_ubyte), ("BitSize", _wt.USHORT),
+                ("ReportCount", _wt.USHORT), ("Reserved2", _wt.USHORT * 5),
+                ("UnitsExp", _wt.ULONG), ("Units", _wt.ULONG),
+                ("LogicalMin", _wt.LONG), ("LogicalMax", _wt.LONG),
+                ("PhysicalMin", _wt.LONG), ("PhysicalMax", _wt.LONG),
+                # union {Range; NotRange} — 8 USHORTs either way; [0]=UsageMin/Usage
+                ("Usage", _wt.USHORT), ("UsageMax", _wt.USHORT),
+                ("StringMin", _wt.USHORT), ("StringMax", _wt.USHORT),
+                ("DesignatorMin", _wt.USHORT), ("DesignatorMax", _wt.USHORT),
+                ("DataIndexMin", _wt.USHORT), ("DataIndexMax", _wt.USHORT)]
+
+_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, _wt.HWND, _wt.UINT,
+                              _wt.WPARAM, _wt.LPARAM)
+
+_touch_keepalive = []   # keep WNDPROC / structs alive for the process lifetime
+# Device-name substrings (lowercase) to IGNORE for touch caret sync — the spacedesk
+# virtual digitizer, whose raw coordinates don't correspond to the display. Only the
+# real 4K touchscreen is trusted. Refined once we see the actual device names.
+_TOUCH_EXCLUDE = ["spacedesk", "virtual", "ddk"]
+
+def _touch_watch_thread():
+    try:
+        _touch_watch_impl()
+    except Exception as e:
+        import traceback
+        log(f"[touch] thread crashed: {e!r}\n{traceback.format_exc()}")
+
+def _touch_watch_impl():
+    u   = ctypes.windll.user32
+    hid = ctypes.windll.hid
+    k32 = ctypes.windll.kernel32
+    k32.GetModuleHandleW.restype = ctypes.c_void_p
+    u.DefWindowProcW.restype  = ctypes.c_longlong
+    u.DefWindowProcW.argtypes = [_wt.HWND, _wt.UINT, _wt.WPARAM, _wt.LPARAM]
+
+    u.GetRawInputData.argtypes = [_wt.HANDLE, _wt.UINT, ctypes.c_void_p,
+                                  ctypes.POINTER(_wt.UINT), _wt.UINT]
+    u.GetRawInputDeviceInfoW.argtypes = [_wt.HANDLE, _wt.UINT, ctypes.c_void_p,
+                                         ctypes.POINTER(_wt.UINT)]
+    hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(_HIDP_CAPS)]
+    hid.HidP_GetValueCaps.argtypes = [ctypes.c_int, ctypes.POINTER(_HIDP_VALUE_CAPS),
+                                      ctypes.POINTER(_wt.USHORT), ctypes.c_void_p]
+    hid.HidP_GetUsageValue.argtypes = [ctypes.c_int, _wt.USHORT, _wt.USHORT, _wt.USHORT,
+                                       ctypes.POINTER(_wt.ULONG), ctypes.c_void_p,
+                                       ctypes.c_char_p, _wt.ULONG]
+    u.RegisterRawInputDevices.argtypes = [ctypes.c_void_p, _wt.UINT, _wt.UINT]
+    u.RegisterRawInputDevices.restype  = _wt.BOOL
+    u.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, _wt.UINT, _wt.UINT]
+
+    u.GetRawInputDeviceInfoW.restype = ctypes.c_int
+    state = {"last_clear": 0.0, "prep_cache": {}, "name_cache": {}}
+    RIDI_DEVICENAME = 0x20000007
+
+    def _dev_name(hdev):
+        nm = state["name_cache"].get(hdev)
+        if nm is not None:
+            return nm
+        nsz = _wt.UINT(0)
+        u.GetRawInputDeviceInfoW(_wt.HANDLE(hdev), RIDI_DEVICENAME, None,
+                                 ctypes.byref(nsz))
+        nm = ""
+        if nsz.value:
+            nb = ctypes.create_unicode_buffer(nsz.value + 1)
+            u.GetRawInputDeviceInfoW(_wt.HANDLE(hdev), RIDI_DEVICENAME, nb,
+                                     ctypes.byref(nsz))
+            nm = nb.value
+        state["name_cache"][hdev] = nm
+        return nm
+
+    def _handle_input(lparam):
+        # Parse the contact X/Y and map to the primary display, then only CLEAR when
+        # the tap is NOT on the emulator (a real caret reposition). We also skip taps
+        # from the spacedesk virtual digitizer, whose coordinates don't correspond to
+        # the display — only the REAL 4K touchscreen is trusted (_TOUCH_EXCLUDE names).
+        size = _wt.UINT(0)
+        u.GetRawInputData(_wt.HANDLE(lparam), _RID_INPUT, None,
+                          ctypes.byref(size), ctypes.sizeof(_RAWINPUTHEADER))
+        if size.value == 0:
+            return
+        buf = (ctypes.c_ubyte * size.value)()
+        if u.GetRawInputData(_wt.HANDLE(lparam), _RID_INPUT, buf,
+                             ctypes.byref(size), ctypes.sizeof(_RAWINPUTHEADER)) <= 0:
+            return
+        hdr = ctypes.cast(buf, ctypes.POINTER(_RAWINPUTHEADER)).contents
+        if hdr.dwType != _RIM_TYPEHID:
+            return   # mouse — the click watcher handles those
+        hdev = hdr.hDevice
+        name = _dev_name(hdev)
+        lname = name.lower()
+        excluded = any(x in lname for x in _TOUCH_EXCLUDE)
+
+        off = ctypes.sizeof(_RAWINPUTHEADER)
+        size_hid = int.from_bytes(bytes(buf[off:off+4]), "little")
+        count    = int.from_bytes(bytes(buf[off+4:off+8]), "little")
+        report0  = off + 8
+        if size_hid == 0 or count == 0:
+            return
+
+        prep = state["prep_cache"].get(hdev)
+        if prep is None:
+            psz = _wt.UINT(0)
+            u.GetRawInputDeviceInfoW(_wt.HANDLE(hdev), _RIDI_PREPARSEDDATA, None,
+                                     ctypes.byref(psz))
+            if psz.value == 0:
+                return
+            prep = (ctypes.c_ubyte * psz.value)()
+            u.GetRawInputDeviceInfoW(_wt.HANDLE(hdev), _RIDI_PREPARSEDDATA, prep,
+                                     ctypes.byref(psz))
+            state["prep_cache"][hdev] = prep
+        prep_p = ctypes.cast(prep, ctypes.c_void_p)
+
+        caps = _HIDP_CAPS()
+        if hid.HidP_GetCaps(prep_p, ctypes.byref(caps)) != _HIDP_STATUS_SUCCESS:
+            return
+        n = _wt.USHORT(caps.NumberInputValueCaps)
+        if n.value == 0:
+            return
+        vcaps = (_HIDP_VALUE_CAPS * n.value)()
+        if hid.HidP_GetValueCaps(_HIDP_Input, vcaps, ctypes.byref(n),
+                                 prep_p) != _HIDP_STATUS_SUCCESS:
+            return
+        xmax = ymax = 0
+        for i in range(n.value):
+            vc = vcaps[i]
+            if vc.UsagePage == 0x01 and vc.Usage == 0x30:   xmax = vc.LogicalMax
+            elif vc.UsagePage == 0x01 and vc.Usage == 0x31: ymax = vc.LogicalMax
+        if xmax <= 0 or ymax <= 0:
+            return
+
+        rpt = (ctypes.c_char * size_hid).from_buffer(buf, report0)
+        xval = _wt.ULONG(0); yval = _wt.ULONG(0)
+        if (hid.HidP_GetUsageValue(_HIDP_Input, 0x01, 0, 0x30, ctypes.byref(xval),
+                                   prep_p, rpt, size_hid) != _HIDP_STATUS_SUCCESS
+            or hid.HidP_GetUsageValue(_HIDP_Input, 0x01, 0, 0x31, ctypes.byref(yval),
+                                      prep_p, rpt, size_hid) != _HIDP_STATUS_SUCCESS):
+            return
+
+        sw = u.GetSystemMetrics(0); sh = u.GetSystemMetrics(1)   # primary display px
+        sx = int(xval.value / xmax * sw)
+        sy = int(yval.value / ymax * sh)
+
+        now = time.time()
+        emu = _find_emulator_hwnd()
+        on_emu = False
+        _er = None
+        if emu:
+            rc = _RECT(); _GetWindowRect(ctypes.c_void_p(emu), ctypes.byref(rc))
+            _er = (rc.left, rc.top, rc.right, rc.bottom)
+            pad = 45
+            on_emu = (rc.left - pad <= sx <= rc.right + pad
+                      and rc.top - pad <= sy <= rc.bottom + pad)
+        if excluded:
+            return
+        # Log the decision once per distinct tap (gap since the last touch event).
+        settled = now - state.get("last_log", 0) > 0.3
+        if settled:
+            state["last_log"] = now
+            log(f"[touch] tap screen=({sx},{sy}) on_emu={on_emu} "
+                f"-> {'skip (Gboard)' if on_emu else 'CLEAR (reposition)'}")
+        if not on_emu and now - state["last_clear"] > 0.4:
+            send_to_android("CLEAR")
+            state["last_clear"] = now
+
+    def _wndproc(hwnd, msg, wparam, lparam):
+        if msg == _WM_INPUT:
+            try:
+                _handle_input(lparam)
+            except Exception as e:
+                log(f"[touch] parse error: {e!r}")
+        return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    proc = _WNDPROC(_wndproc)
+    _touch_keepalive.append(proc)      # keep alive for process lifetime
+    CLASS = "GboardIMETouchSink"
+    class _WNDCLASS(ctypes.Structure):
+        _fields_ = [("style", _wt.UINT), ("lpfnWndProc", _WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", _wt.HINSTANCE), ("hIcon", _wt.HANDLE),
+                    ("hCursor", _wt.HANDLE), ("hbrBackground", _wt.HANDLE),
+                    ("lpszMenuName", _wt.LPCWSTR), ("lpszClassName", _wt.LPCWSTR)]
+    wc = _WNDCLASS()
+    wc.lpfnWndProc = proc
+    wc.hInstance = k32.GetModuleHandleW(None)
+    wc.lpszClassName = CLASS
+    u.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASS)]
+    if not u.RegisterClassW(ctypes.byref(wc)):
+        log("[touch] RegisterClassW failed; touch tap sync disabled")
+        return
+    # A normal (never-shown) top-level window — NOT message-only (HWND_MESSAGE),
+    # which does not receive WM_INPUT. WS_OVERLAPPED, never ShowWindow'd.
+    WS_OVERLAPPED = 0x00000000
+    u.CreateWindowExW.restype  = _wt.HWND
+    u.CreateWindowExW.argtypes = [_wt.DWORD, _wt.LPCWSTR, _wt.LPCWSTR, _wt.DWORD,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                  ctypes.c_void_p]
+    hwnd = u.CreateWindowExW(0, CLASS, "GboardIMETouchSink", WS_OVERLAPPED,
+                             0, 0, 0, 0, None, None, wc.hInstance, None)
+    if not hwnd:
+        log("[touch] CreateWindow failed; touch tap sync disabled")
+        return
+
+    # Register every digitizer usage so we catch whatever the touchscreen/pen reports
+    # as: touchscreen (0x04), pen (0x02), digitizer (0x01), touchpad (0x05). Also
+    # register generic mouse (page 0x01 usage 0x02) as a plumbing test — if we see
+    # WM_INPUT on mouse moves, the window/loop work and only the digitizer usage is off.
+    devs = [(0x0D, 0x04), (0x0D, 0x02), (0x0D, 0x01), (0x0D, 0x05), (0x01, 0x02)]
+    rids = (_RAWINPUTDEVICE * len(devs))()
+    for i, (pg, us) in enumerate(devs):
+        rids[i] = _RAWINPUTDEVICE(pg, us, _RIDEV_INPUTSINK, hwnd)
+    if not u.RegisterRawInputDevices(rids, len(devs),
+                                     ctypes.sizeof(_RAWINPUTDEVICE)):
+        log("[touch] RegisterRawInputDevices failed; tap sync off")
+        return
+    log(f"[touch] touch-tap watcher started ({len(devs)} raw-input devices)")
+
+    msg = _wt.MSG() if hasattr(_wt, "MSG") else None
+    class _MSG(ctypes.Structure):
+        _fields_ = [("hwnd", _wt.HWND), ("message", _wt.UINT),
+                    ("wParam", _wt.WPARAM), ("lParam", _wt.LPARAM),
+                    ("time", _wt.DWORD), ("pt_x", _wt.LONG), ("pt_y", _wt.LONG)]
+    m = _MSG()
+    while u.GetMessageW(ctypes.byref(m), None, 0, 0) > 0:
+        u.TranslateMessage(ctypes.byref(m))
+        u.DispatchMessageW(ctypes.byref(m))
 
 
 def _find_editable_descendant(ctrl, depth=6):
@@ -1323,17 +1671,7 @@ def _focus_watcher():
                         last_cursor    = None
                         threading.Thread(
                             target=_sync_field_to_android_thread, daemon=True).start()
-                elif skey is not None and skey == _last_sync_key \
-                        and not typed and since_inject > 0.4 and not resync_armed:
-                    # Same field: poll cursor for mouse-click repositioning.
-                    # EM_GETSEL is fast enough to call inline every 250 ms.
-                    try:
-                        cur = _get_cursor_only(ctrl)
-                        if cur is not None and cur != last_cursor:
-                            last_cursor = cur
-                            send_to_android(f"CURSOR:{cur[0]}:{cur[1]}")
-                    except Exception:
-                        pass
+                # (Click-to-reposition is handled by _click_watch_thread.)
             else:
                 # Resync-armed-and-focus-non-editable. Two sub-cases:
                 # (a) focused ctrl has an editable descendant (rare; Electron usually
@@ -1371,6 +1709,7 @@ def _focus_watcher():
                         try: ctn = ctrl.ControlTypeName if ctrl else None
                         except Exception: pass
                         log(f"[resync] tick NOT editable ctrl={ctn} since_inject={since_inject:.2f}")
+                # (Click-to-reposition handled by _click_watch_thread — see above.)
         except Exception as e:
             log(f"[auto] watcher loop error (continuing): {e!r}")
             time.sleep(0.5)
@@ -1594,6 +1933,11 @@ if __name__ == "__main__":
     # 3c. Auto show/hide: UIA focus watcher + physical-typing hook
     threading.Thread(target=_focus_watcher, daemon=True).start()
     threading.Thread(target=_kbd_hook_thread, daemon=True).start()
+    # 3c-bis. Reset the relay buffer when the user repositions the Windows caret by
+    # MOUSE click or a REAL-touchscreen TAP (the spacedesk virtual digitizer is
+    # excluded by device name — its coords don't map to the display).
+    threading.Thread(target=_click_watch_thread, daemon=True).start()
+    threading.Thread(target=_touch_watch_thread, daemon=True).start()
 
     # 3d. Custom dark-grey title bar overlay (drag + minimize) above the emulator
     threading.Thread(target=_titlebar_thread, daemon=True).start()

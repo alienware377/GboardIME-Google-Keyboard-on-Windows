@@ -342,6 +342,15 @@ public class RelayEditText extends EditText {
                         if ((meta & KeyEvent.META_SHIFT_ON) != 0) mods += "SHIFT+";
                         if ((meta & KeyEvent.META_ALT_ON) != 0)   mods += "ALT+";
                         send("KEY:" + mods + name);
+                    } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL
+                            && (getText() == null || getText().length() == 0)) {
+                        // Normal typing: backspace deletes relay text and is forwarded by
+                        // deleteSurroundingText. But once the relay box is EMPTY (e.g. it
+                        // was reset by a click/tap reposition CLEAR), Gboard has nothing
+                        // to delete locally, so backspace would do nothing on Windows.
+                        // Forward it as a Windows backspace so delete keeps working — the
+                        // Windows field may still have text before the caret.
+                        send("DEL:1");
                     }
                 }
                 return super.sendKeyEvent(event);
