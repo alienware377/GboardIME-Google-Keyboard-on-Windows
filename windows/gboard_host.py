@@ -499,6 +499,12 @@ _emulator_visible = None   # None = unknown; will be synced on first toggle
 # Auto show/hide ("act like the Windows touch keyboard"):
 _auto_mode   = True        # master enable for focus-driven show/hide
 _auto_shown  = False       # True only when the keyboard was raised BY auto-focus
+# Set by the title bar's minimize button: the button is a no-activate overlay, so
+# focus STAYS in the text field and auto-show would re-raise the keyboard on the
+# very next tick, negating the click. The watcher consumes this by suppressing
+# auto-show for the CURRENTLY focused field only (same mechanism as the physical-
+# typing suppression) — moving focus to another field resumes auto show/hide.
+_suppress_request = threading.Event()
                            # (not by the Ctrl+Alt+K hotkey). Physical typing only
                            # auto-hides an auto-shown keyboard, so a manual show stays put.
 
@@ -829,6 +835,10 @@ def _titlebar_thread():
     def _on_min_leave(_):  btn.configure(bg=_BAR_BG, fg=_BAR_FG)
     def _on_min_click(_):
         try:
+            # Suppress BEFORE hiding so the watcher can't re-show in between: the
+            # bar never takes focus, so the text field stays focused and auto-show
+            # would otherwise negate the click on the next tick.
+            _suppress_request.set()
             hide_emulator()
         except Exception as e:
             log(f"[titlebar] minimize failed: {e}")
@@ -1485,28 +1495,117 @@ def _sync_field_to_android_thread():
 # Editable control types we treat as "an input box" (by ControlTypeName).
 _EDITABLE_CTRLS = {"EditControl", "DocumentControl", "ComboBoxControl"}
 
+# UIA property ids for the Electron/Chromium fallback below.
+_UIA_LEGACY_ROLE  = 30095   # UIA_LegacyIAccessibleRolePropertyId
+_UIA_LEGACY_STATE = 30096   # UIA_LegacyIAccessibleStatePropertyId
+_UIA_ARIA_ROLE    = 30101   # UIA_AriaRolePropertyId
+_UIA_HAS_TEXTPATTERN = 30040   # UIA_IsTextPatternAvailablePropertyId
+_MSAA_ROLE_TEXT   = 42      # ROLE_SYSTEM_TEXT (selectable/editable text)
+_MSAA_STATE_READONLY = 0x40
+_ARIA_TEXT_ROLES  = {"textbox", "searchbox"}
+
 def _is_editable_focus(ctrl):
     """True if the UIA-focused control is a writable text field."""
     if ctrl is None:
         return False
     try:
-        if ctrl.ControlTypeName not in _EDITABLE_CTRLS:
-            return False
+        ctn = ctrl.ControlTypeName
     except Exception:
         return False
-    # Reject read-only fields (labels rendered as Edit, disabled boxes, etc.)
+    if ctn in _EDITABLE_CTRLS:
+        # Reject read-only fields (labels rendered as Edit, disabled boxes, etc.)
+        try:
+            if not ctrl.IsEnabled:
+                return False
+        except Exception:
+            pass
+        try:
+            vp = ctrl.GetValuePattern()
+            if vp is not None and vp.IsReadOnly:
+                return False
+        except Exception:
+            pass
+        return True
+    # Electron/Chromium fallback: contenteditable inputs focus as a GroupControl /
+    # TextControl wrapper (not Edit/Document), so the type check above misses them
+    # and auto-show never fires. All checks below are CHEAP single-property reads
+    # (milliseconds) — never TextPattern range reads (~1s on Electron).
+    if ctn in ("GroupControl", "PaneControl", "TextControl"):
+        # MSAA legacy role 42 = editable text (with the READONLY state bit clear).
+        try:
+            role = ctrl.GetPropertyValue(_UIA_LEGACY_ROLE)
+            if role is not None and int(role) == _MSAA_ROLE_TEXT:
+                state = 0
+                try:
+                    state = int(ctrl.GetPropertyValue(_UIA_LEGACY_STATE) or 0)
+                except Exception:
+                    pass
+                if not (state & _MSAA_STATE_READONLY):
+                    return True
+        except Exception:
+            pass
+        # Explicit ARIA textbox role.
+        try:
+            aria = ctrl.GetPropertyValue(_UIA_ARIA_ROLE)
+            if aria and str(aria).strip().lower() in _ARIA_TEXT_ROLES:
+                return True
+        except Exception:
+            pass
+    # Probed on this machine: some Electron contenteditables focus as a GroupControl
+    # with lrole=20 aria='group' — no textbox marker at all — but it's the only
+    # group wrapper that advertises TextPattern AVAILABILITY (a cheap boolean;
+    # checking availability is NOT the slow part, reading ranges is). Static text
+    # nodes also advertise it, so this is restricted to GroupControl.
+    if ctn == "GroupControl":
+        try:
+            if bool(ctrl.GetPropertyValue(_UIA_HAS_TEXTPATTERN)):
+                return True
+        except Exception:
+            pass
+    return False
+
+# Apps with NO accessibility tree (OpenGL-drawn UIs like Blender expose only a bare
+# WindowControl), where field detection is impossible. While one of these is the
+# foreground app, treat focus as editable so the keyboard auto-shows. Empty by
+# default — always-on for a whole app proved more annoying than useful (tried with
+# Blender); use Ctrl+Alt+K or the tray to summon the keyboard in such apps.
+_ALWAYS_EDITABLE_EXES = set()
+_pid_exe_cache = {}
+
+_OpenProcess = ctypes.windll.kernel32.OpenProcess
+_OpenProcess.restype  = ctypes.c_void_p
+_OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+_QueryFullProcessImageNameW = ctypes.windll.kernel32.QueryFullProcessImageNameW
+_QueryFullProcessImageNameW.restype  = ctypes.wintypes.BOOL
+_QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD,
+                                        ctypes.c_wchar_p, ctypes.POINTER(ctypes.wintypes.DWORD)]
+
+def _fg_exe(fg):
+    """Lowercase exe basename of the window's owning process ('' on failure)."""
     try:
-        if not ctrl.IsEnabled:
-            return False
+        pid = ctypes.wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(ctypes.c_void_p(fg),
+                                                      ctypes.byref(pid))
+        pid = pid.value
+        if not pid:
+            return ""
+        exe = _pid_exe_cache.get(pid)
+        if exe is not None:
+            return exe
+        exe = ""
+        h = _OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if h:
+            buf = ctypes.create_unicode_buffer(260)
+            sz = ctypes.wintypes.DWORD(260)
+            if _QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(sz)):
+                exe = os.path.basename(buf.value).lower()
+            ctypes.windll.kernel32.CloseHandle(h)
+        if len(_pid_exe_cache) > 256:
+            _pid_exe_cache.clear()
+        _pid_exe_cache[pid] = exe
+        return exe
     except Exception:
-        pass
-    try:
-        vp = ctrl.GetValuePattern()
-        if vp is not None and vp.IsReadOnly:
-            return False
-    except Exception:
-        pass
-    return True
+        return ""
 
 def _sync_key(fg, ctrl):
     """Stable per-field identity used to decide when to push a fresh SYNC to Gboard.
@@ -1595,6 +1694,9 @@ def _focus_watcher():
                 rs = _is_emu_shown(_find_emulator_hwnd())
                 log(f"[auto] watcher alive (mode={_auto_mode} shown={rs} auto={_auto_shown})")
             if not _auto_mode:
+                # No auto-show to negate a minimize; drop any stale request so it
+                # can't suppress a random field after auto mode is re-enabled.
+                _suppress_request.clear()
                 continue
             try:
                 ctrl = auto.GetFocusedControl()
@@ -1609,6 +1711,16 @@ def _focus_watcher():
                 continue
             sig = _focus_sig(fg, ctrl)
             editable = _is_editable_focus(ctrl)
+            # No-accessibility apps (Blender): treat the whole app as editable.
+            if not editable and fg and _fg_exe(fg) in _ALWAYS_EDITABLE_EXES:
+                editable = True
+            # Minimize-button click: suppress auto-show for the field focused right
+            # now (it kept focus through the click). Cleared below when focus moves,
+            # so the auto show/hide MODE itself is not affected.
+            if _suppress_request.is_set():
+                _suppress_request.clear()
+                suppress_sig = sig
+                log("[auto] minimize click -> auto-show suppressed for current field")
             # Trust the REAL window state, not the flag — a manual minimize/close
             # otherwise desyncs the flag and auto-show stops working entirely.
             shown = _is_emu_shown(_find_emulator_hwnd())
