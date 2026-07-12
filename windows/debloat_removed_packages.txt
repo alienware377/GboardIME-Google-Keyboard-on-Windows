@@ -2,8 +2,7 @@
 # Removal method: `adb -s emulator-5554 shell pm uninstall --user 0 <pkg>`
 #   (system image untouched; data partition only). REVERSIBLE per package with:
 #   `adb -s emulator-5554 shell pm install-existing <pkg>`
-# Full AVD backup taken first at:
-#   C:\Users\djjac\Documents\GboardIME\avd_backup\GboardIME_Root_20260622_201511
+# (Take a full AVD backup first: copy %USERPROFILE%\.android\avd\GboardIME_Root.avd)
 # Verified AFTER removal: Gboard renders + predicts, swipe path intact, even with GMS gone.
 
 ## Batch A — user apps + their background services
