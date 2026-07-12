@@ -26,7 +26,8 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 
 $files = @(
     "install.ps1","launch.ps1","stop.ps1","Install.cmd","README.md",
-    "windows\gboard_host.py","windows\GboardRelay.apk","windows\debloat_removed_packages.txt"
+    "windows\gboard_host.py","windows\GboardRelay.apk","windows\debloat_removed_packages.txt",
+    "assets\GboardIME.ico","assets\icon.png"
 )
 foreach ($f in $files) {
     $src = Join-Path $REPO $f
@@ -53,11 +54,13 @@ Say "Compiling Setup.exe..."
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) { $csc = "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" }
 $compArg = "/resource:`"$ZIP`",GboardIME.payload.zip"
+$icoArg  = "/win32icon:`"$(Join-Path $REPO 'assets\GboardIME.ico')`""
 & $csc /nologo /target:exe /platform:anycpu `
     "/out:$OUT" `
     /reference:System.IO.Compression.dll `
     /reference:System.IO.Compression.FileSystem.dll `
     $compArg `
+    $icoArg `
     (Join-Path $PSScriptRoot "Setup.cs")
 if (-not (Test-Path $OUT)) { throw "compile failed" }
 Say ("Built {0} ({1:N0} bytes)" -f $OUT, (Get-Item $OUT).Length)

@@ -261,7 +261,9 @@ function Make-Shortcut($name,$script){
     $lnk.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     $lnk.Arguments  = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ROOT\$script`""
     $lnk.WorkingDirectory = $ROOT
-    $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
+    $ico = Join-Path $ROOT "assets\GboardIME.ico"
+    if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
+    else { $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,13" }
     $lnk.Save()
 }
 Make-Shortcut "Start GboardIME.lnk" "launch.ps1"

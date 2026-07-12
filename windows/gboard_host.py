@@ -1970,6 +1970,15 @@ _SIZES = [
 
 # ── System tray icon ─────────────────────────────────────────────────────────
 def _make_icon_image():
+    # Prefer the real app icon (assets/icon.png, repo root); fall back to the
+    # old drawn "KB" square if the asset is missing.
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        p = os.path.join(root, "assets", "icon.png")
+        if os.path.exists(p):
+            return Image.open(p).convert("RGBA").resize((64, 64), Image.LANCZOS)
+    except Exception:
+        pass
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle([2, 2, 62, 62], radius=12, fill="#1565C0")
