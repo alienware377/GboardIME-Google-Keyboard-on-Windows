@@ -100,11 +100,14 @@ public class MainActivity extends Activity {
             ComponentName admin = new ComponentName(this, RelayAdminReceiver.class);
             if (dpm != null && dpm.isDeviceOwnerApp(getPackageName())) {
                 dpm.setLockTaskPackages(admin, new String[]{ getPackageName() });
-                // Minimal system UI in kiosk (no notifications / quick settings). The
-                // status bar may still be drawn, but we colour it slate above so it's
-                // not a visible black band.
+                // NOTE: do NOT call setLockTaskFeatures(LOCK_TASK_FEATURE_NONE) here.
+                // On this image it also engaged screen-capture protection, which made
+                // capture-backed surfaces - the text-selection handles, magnifier and
+                // the Copy/Paste floating toolbar - render as BLACK BOXES (and broke
+                // adb screencap). Default lock-task features keep those working; the
+                // black status-bar band is handled by colouring the bars slate.
                 try { dpm.setLockTaskFeatures(admin,
-                        DevicePolicyManager.LOCK_TASK_FEATURE_NONE); } catch (Exception ignored2) {}
+                        DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS); } catch (Exception ignored2) {}
             }
             // startLockTask() works when the package is lock-task-whitelisted (above);
             // otherwise it falls back to screen-pinning (which shows a confirm dialog),
