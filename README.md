@@ -11,6 +11,20 @@ a tiny relay app captures its actual input events and forwards them to a Windows
 process that replays them with `SendInput`. Everything stays on `localhost` — no external
 network is used, no telemetry, no account required.
 
+<p align="center">
+  <img src="assets/demo-swipe.webp" alt="Swipe-typing on Gboard with the word landing live in Windows Notepad" width="740">
+</p>
+<p align="center">
+  <em>Glide-typing on Gboard, landing live in Notepad.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-tray.png" alt="The floating Gboard keyboard over the Windows desktop, with the tray menu open: toggle keyboard, auto show/hide, start at boot, dock, and ten keyboard sizes" width="420">
+</p>
+<p align="center">
+  <em>The floating keyboard and its tray menu — auto show/hide, start at boot, ten sizes.</em>
+</p>
+
 **Why this exists.** Windows has no first-party swipe / glide-typing keyboard and no built-in
 Gboard equivalent. The Windows on-screen touch keyboard does not glide-type accurately, has
 no Gboard suggestion model, and lacks Gboard features like the clipboard tool and emoji
