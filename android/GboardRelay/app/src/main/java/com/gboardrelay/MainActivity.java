@@ -251,7 +251,9 @@ public class MainActivity extends Activity {
                     String line;
                     while ((line = reader.readLine()) != null) {
                         if ("CLEAR".equals(line)) {
-                            mainHandler.post(() -> inputField.resetBuffer());
+                            // Reposition CLEAR: install the shadow buffer (not a truly
+                            // empty field) so Gboard keeps its editing panel enabled.
+                            mainHandler.post(() -> inputField.enterShadowBuffer());
                         } else if (line.startsWith("SYNC:")) {
                             final String payload = line.substring(5);
                             mainHandler.post(() -> handleSync(payload));

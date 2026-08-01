@@ -55,6 +55,19 @@ public class RelayEditText extends EditText {
     /** True while one of OUR InputConnection overrides is mutating the field, so
      *  the TextWatcher knows that change is already accounted for and skips it. */
     private boolean icHandled = false;
+    /** True when the CURRENT selection was created through forwarded key events
+     *  (Select mode's Shift+arrows, or Select all's Ctrl+A) and therefore exists on
+     *  the WINDOWS side too. Deletion semantics differ: Windows collapses a selection
+     *  with ONE backspace / replaces it by typing, so relaying per-char deletes for a
+     *  mirrored selection removes double the text. A selection made only locally
+     *  (dragging the relay's handles, swipe-delete highlight) leaves this false. */
+    private boolean winSelection = false;
+    /** True while the buffer holds the shadow padding installed after a reposition
+     *  CLEAR (see enterShadowBuffer). All relaying stays relative, so the fake
+     *  content never leaks to Windows; it only exists so Gboard enables its editing
+     *  panel (arrows / Select / Copy / Cut grey out on an empty field). */
+    private boolean shadowMode = false;
+    private static final int SHADOW_PAD = 40;   // spaces each side of the caret
     /** Trim the buffer once it gets long, but only at a word boundary. */
     private static final int TRIM_AT = 800, TRIM_KEEP = 400;
 
@@ -77,12 +90,36 @@ public class RelayEditText extends EditText {
 
     public void setSender(Sender s) { this.sender = s; }
 
-    /** Reset both our model and the on-screen buffer (server CLEAR command). */
+    /** Reset both our model and the on-screen buffer to truly empty. */
     public void resetBuffer() {
         composing = "";
+        shadowMode = false;
+        winSelection = false;
         icHandled = true;
         try { setText(""); } finally { icHandled = false; }
         prevText = "";
+    }
+
+    /** Host CLEAR (caret repositioned in Windows, content unknown): instead of a
+     *  truly empty buffer — which makes Gboard GREY OUT its whole editing panel —
+     *  install invisible shadow padding (spaces) with the caret centered. Gboard
+     *  then keeps arrows / Select / Select all / Copy / Cut enabled, and because
+     *  every relayed operation is RELATIVE (key events, Ctrl combos, caret deltas),
+     *  they act correctly on the real Windows text. The padding itself is never
+     *  sent anywhere. */
+    public void enterShadowBuffer() {
+        composing = "";
+        winSelection = false;
+        icHandled = true;
+        try {
+            char[] sp = new char[SHADOW_PAD * 2];
+            java.util.Arrays.fill(sp, ' ');
+            String s = new String(sp);
+            setText(s);
+            setSelection(SHADOW_PAD, SHADOW_PAD);
+        } finally { icHandled = false; }
+        prevText = getText() != null ? getText().toString() : "";
+        shadowMode = true;
     }
 
     /** Called on SYNC: from the Windows host — replaces buffer with the current
@@ -90,6 +127,8 @@ public class RelayEditText extends EditText {
      *  Guarded with icHandled so the TextWatcher doesn't relay the setText back. */
     public void syncFromHost(String text, int selStart, int selEnd) {
         composing = "";
+        shadowMode = false;
+        winSelection = false;
         icHandled = true;
         try {
             setText(text);
@@ -220,12 +259,25 @@ public class RelayEditText extends EditText {
             @Override
             public boolean commitText(CharSequence text, int newCursorPosition) {
                 Log.d(TAG, "commitText(" + text + ") composing=" + composing
-                        + " sel=" + selectionLen());
+                        + " sel=" + selectionLen() + " winSel=" + winSelection);
                 // Commit replaces any composing region or active selection.
-                int del = composing.length() > 0 ? composing.length() : selectionLen();
-                sendDel(del);
-                sendText(text);
+                int sel = selectionLen();
+                if (composing.length() > 0) {
+                    sendDel(composing.length());
+                    sendText(text);
+                } else if (sel > 0 && winSelection) {
+                    // The SAME selection exists on Windows (it was made via forwarded
+                    // Shift+arrows / Ctrl+A). Typing replaces it there by itself, so
+                    // sending per-char deletes would remove EXTRA text. For a pure
+                    // delete (empty commit) one backspace collapses the selection.
+                    if (text.length() == 0) sendDel(1);
+                    sendText(text);
+                } else {
+                    sendDel(sel);
+                    sendText(text);
+                }
                 composing = "";
+                winSelection = false;
                 icHandled = true;
                 try {
                     boolean r = super.commitText(text, newCursorPosition);
@@ -239,10 +291,13 @@ public class RelayEditText extends EditText {
                 Log.d(TAG, "setComposingText(" + text + ") composing=" + composing
                         + " sel=" + selectionLen());
                 // Starting to compose over a selection (e.g. retyping after a
-                // swipe-delete selection) replaces that selection first.
+                // swipe-delete selection) replaces that selection first. If the
+                // selection is MIRRORED on Windows (winSelection), typing the first
+                // composing char replaces it there by itself — no deletes needed.
                 if (composing.length() == 0) {
                     int sel = selectionLen();
-                    if (sel > 0) { sendDel(sel); }
+                    if (sel > 0 && !winSelection) { sendDel(sel); }
+                    winSelection = false;
                 }
                 replaceComposing(text.toString());
                 icHandled = true;
@@ -314,10 +369,28 @@ public class RelayEditText extends EditText {
                 int curPos = getSelectionStart();   // relay caret == Windows caret (invariant)
                 Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled
                         + " from=" + curPos + " composing=" + composing);
+                if (!icHandled && start != end) {
+                    // A non-collapsed setSelection is a RELAY-ONLY selection (swipe-
+                    // delete highlight, drag handles) — it is NOT mirrored on Windows.
+                    winSelection = false;
+                }
                 if (!icHandled && start == end) {
+                    winSelection = false;           // collapsed on both sides
                     int delta = start - curPos;
-                    if (delta > 0)      send("KEY:RIGHT*" + delta);
-                    else if (delta < 0) send("KEY:LEFT*"  + (-delta));
+                    if (delta != 0) {
+                        int len = getText() != null ? getText().length() : 0;
+                        if (shadowMode && start <= 0) {
+                            // Shadow padding: relay offsets are fiction, so the |< / >|
+                            // jump buttons map to ABSOLUTE Windows jumps instead.
+                            send("KEY:CTRL+HOME");
+                        } else if (shadowMode && start >= len) {
+                            send("KEY:CTRL+END");
+                        } else if (delta > 0) {
+                            send("KEY:RIGHT*" + delta);
+                        } else {
+                            send("KEY:LEFT*" + (-delta));
+                        }
+                    }
                 }
                 return super.setSelection(start, end);
             }
@@ -342,15 +415,28 @@ public class RelayEditText extends EditText {
                         if ((meta & KeyEvent.META_SHIFT_ON) != 0) mods += "SHIFT+";
                         if ((meta & KeyEvent.META_ALT_ON) != 0)   mods += "ALT+";
                         send("KEY:" + mods + name);
-                    } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL
-                            && (getText() == null || getText().length() == 0)) {
-                        // Normal typing: backspace deletes relay text and is forwarded by
-                        // deleteSurroundingText. But once the relay box is EMPTY (e.g. it
-                        // was reset by a click/tap reposition CLEAR), Gboard has nothing
-                        // to delete locally, so backspace would do nothing on Windows.
-                        // Forward it as a Windows backspace so delete keeps working — the
-                        // Windows field may still have text before the caret.
-                        send("DEL:1");
+                        // Shift+nav extends a selection on BOTH sides; a plain nav key
+                        // collapses both. Track it so deletes over a mirrored selection
+                        // aren't double-relayed.
+                        winSelection = (meta & KeyEvent.META_SHIFT_ON) != 0;
+                    } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
+                        if (selectionLen() > 0 && winSelection) {
+                            // Backspace over a MIRRORED selection: one backspace deletes
+                            // the whole selection on Windows. Apply the same one-key
+                            // semantics and swallow the local removal (icHandled) so the
+                            // safety-net watcher doesn't relay it again per-char.
+                            send("DEL:1");
+                            winSelection = false;
+                            icHandled = true;
+                            try { return super.sendKeyEvent(event); }
+                            finally { icHandled = false; }
+                        }
+                        if (getText() == null || getText().length() == 0) {
+                            // Empty relay box (e.g. after a reposition CLEAR): Gboard has
+                            // nothing to delete locally, so backspace would do nothing on
+                            // Windows. Forward it — the Windows field may still have text.
+                            send("DEL:1");
+                        }
                     }
                 }
                 return super.sendKeyEvent(event);
@@ -363,11 +449,23 @@ public class RelayEditText extends EditText {
                 // run on the base field so its selection stays in sync; Paste is NOT run
                 // on the base (the emulator clipboard differs from Windows') - we only
                 // forward Ctrl+V so Windows pastes its own clipboard.
-                Log.d(TAG, "performContextMenuAction(" + id + ")");
-                if (id == android.R.id.selectAll) { send("KEY:CTRL+A"); }
-                else if (id == android.R.id.copy) { send("KEY:CTRL+C"); }
-                else if (id == android.R.id.cut)  { send("KEY:CTRL+X"); }
-                else if (id == android.R.id.paste) {
+                Log.d(TAG, "performContextMenuAction(" + id + ") winSel=" + winSelection);
+                if (id == android.R.id.selectAll) {
+                    send("KEY:CTRL+A");
+                    winSelection = true;   // now selected on BOTH sides
+                } else if (id == android.R.id.copy) {
+                    send("KEY:CTRL+C");
+                } else if (id == android.R.id.cut) {
+                    // Ctrl+X removes the mirrored Windows selection by itself. The base
+                    // cut below removes the RELAY copy — swallow that local removal
+                    // (icHandled) so the safety-net watcher doesn't relay it AGAIN as
+                    // backspaces (that double-deleted: selection + N extra chars).
+                    send("KEY:CTRL+X");
+                    winSelection = false;
+                    icHandled = true;
+                    try { return super.performContextMenuAction(id); }
+                    finally { icHandled = false; }
+                } else if (id == android.R.id.paste) {
                     send("KEY:CTRL+V");
                     return true;   // skip base paste to avoid emulator-clipboard desync
                 }
