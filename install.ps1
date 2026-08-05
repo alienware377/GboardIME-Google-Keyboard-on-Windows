@@ -53,6 +53,18 @@ function Ok($m){ Write-Host "  [OK] $m" -ForegroundColor Green }
 function Warn($m){ Write-Host "  [!] $m" -ForegroundColor Yellow }
 function Die($m){ Write-Host "`n[FATAL] $m" -ForegroundColor Red; exit 1 }
 
+# Run a native tool with stderr merged INSIDE cmd.exe. Under
+# $ErrorActionPreference = "Stop", PowerShell 5.1 turns any native stderr line
+# that crosses its pipeline (via 2>&1) into a terminating NativeCommandError -
+# newer Android cmdline-tools print a harmless "sdkmanager is deprecated"
+# warning to stderr, which aborted the whole install. Merging at the cmd level
+# means PowerShell only ever sees stdout. Returns the combined output lines.
+function Run-Native([string]$exe, [string]$arguments, [string]$stdinText) {
+    $full = "`"$exe`" $arguments 2>&1"
+    if ($stdinText) { return ($stdinText | & $env:ComSpec /s /c $full) }
+    return (& $env:ComSpec /s /c $full)
+}
+
 Write-Host "GboardIME installer" -ForegroundColor Magenta
 Write-Host "===================" -ForegroundColor Magenta
 
@@ -115,12 +127,12 @@ if (-not (Test-Path $sdkManager)) {
 
 # 2. platform-tools + emulator + licenses + system image
 Step "SDK packages"
-"y`ny`ny`ny`ny`ny`n" | & $sdkManager --licenses 2>&1 | Out-Null
-if (-not (Test-Path $ADB))      { Info "Installing platform-tools..."; & $sdkManager "platform-tools" --sdk_root=$SDK 2>&1 | Out-Null }
-if (-not (Test-Path $EMULATOR)) { Info "Installing emulator...";       & $sdkManager "emulator"       --sdk_root=$SDK 2>&1 | Out-Null }
+Run-Native $sdkManager "--licenses" "y`ny`ny`ny`ny`ny`ny`ny`n" | Out-Null
+if (-not (Test-Path $ADB))      { Info "Installing platform-tools..."; Run-Native $sdkManager "platform-tools --sdk_root=`"$SDK`"" | Out-Null }
+if (-not (Test-Path $EMULATOR)) { Info "Installing emulator...";       Run-Native $sdkManager "emulator --sdk_root=`"$SDK`"" | Out-Null }
 if (-not (Test-Path $IMG_PATH)) {
     Info "Downloading system image (~1.5 GB, google_apis API 34)... this can take several minutes"
-    & $sdkManager $SYSIMAGE --sdk_root=$SDK 2>&1 | Out-Null
+    Run-Native $sdkManager "`"$SYSIMAGE`" --sdk_root=`"$SDK`"" | Out-Null
     Ok "System image installed"
 } else { Ok "System image present" }
 if (-not (Test-Path $ADB)) { Die "platform-tools/adb still missing - SDK install failed." }
@@ -128,9 +140,9 @@ if (-not (Test-Path $ADB)) { Die "platform-tools/adb still missing - SDK install
 # 3. Create + patch the AVD
 Step "AVD: $AVD_NAME"
 $avdManager = "$SDK\cmdline-tools\latest\bin\avdmanager.bat"
-$existing = & $avdManager list avd 2>&1
+$existing = (Run-Native $avdManager "list avd") -join "`n"
 if ($existing -notmatch [regex]::Escape($AVD_NAME)) {
-    "no" | & $avdManager create avd --name $AVD_NAME --package $SYSIMAGE --device $DEVICE --force 2>&1 | Out-Null
+    Run-Native $avdManager "create avd --name $AVD_NAME --package `"$SYSIMAGE`" --device $DEVICE --force" "no" | Out-Null
     Ok "AVD created"
 } else { Ok "AVD already exists" }
 
@@ -164,7 +176,7 @@ if (Test-Path $cfg) {
 # 4. Python host dependencies
 Step "Python host dependencies"
 if ($PY) {
-    & $PY -m pip install --user --quiet pystray pillow uiautomation 2>&1 | Out-Null
+    Run-Native $PY "-m pip install --user --quiet pystray pillow uiautomation" | Out-Null
     Ok "pystray, pillow, uiautomation installed"
 } else { Warn "Skipped (no Python)" }
 
@@ -174,7 +186,7 @@ if (-not (Test-Path $APK)) {
     Info "Prebuilt APK missing - building from source (needs Java)..."
     if (-not $env:JAVA_HOME) { Die "Cannot build APK without Java. Install Android Studio." }
     Push-Location "$ROOT\android\GboardRelay"
-    & .\gradlew.bat assembleDebug 2>&1 | Out-Null
+    Run-Native (Join-Path (Get-Location) "gradlew.bat") "assembleDebug" | Out-Null
     Pop-Location
     $built = "$ROOT\android\GboardRelay\app\build\outputs\apk\debug\app-debug.apk"
     if (Test-Path $built) { Copy-Item $built $APK -Force; Ok "APK built" }
@@ -210,13 +222,13 @@ if ($SkipEmulator) {
     & $ADB -s $serial reverse "tcp:$DEVICE_PORT" "tcp:$HOST_PORT" | Out-Null
     Ok "Reverse tunnel device:$DEVICE_PORT -> host:$HOST_PORT"
 
-    & $ADB -s $serial install -r $APK 2>&1 | Out-Null
+    Run-Native $ADB "-s $serial install -r `"$APK`"" | Out-Null
     Ok "Relay app installed"
 
     $imes = (& $ADB -s $serial shell ime list -a -s 2>$null) -join "`n"
     if ($imes -match "com\.google\.android\.inputmethod\.latin") {
-        & $ADB -s $serial shell ime enable $GBOARD_IME 2>&1 | Out-Null
-        & $ADB -s $serial shell ime set $GBOARD_IME 2>&1 | Out-Null
+        Run-Native $ADB "-s $serial shell ime enable $GBOARD_IME" | Out-Null
+        Run-Native $ADB "-s $serial shell ime set $GBOARD_IME" | Out-Null
         Ok "Gboard set as default keyboard"
     } else {
         Warn "Gboard not found on this image. Install it in the emulator, then set it as default."
@@ -229,7 +241,7 @@ if ($SkipEmulator) {
             $pkgs = Get-Content $listFile | Where-Object { $_ -and ($_ -notmatch '^\s*#') } | ForEach-Object { $_.Trim() } | Where-Object { $_ }
             $n = 0
             foreach ($p in $pkgs) {
-                $r = (& $ADB -s $serial shell pm uninstall --user 0 $p 2>&1) -join ""
+                $r = (Run-Native $ADB "-s $serial shell pm uninstall --user 0 $p") -join ""
                 if ($r -match "Success") { $n++ }
             }
             Ok "$n packages removed (reversible with: adb shell pm install-existing <pkg>)"
@@ -238,7 +250,7 @@ if ($SkipEmulator) {
 
     if (-not $SkipKiosk) {
         Step "Kiosk / Lock Task mode"
-        $r = (& $ADB -s $serial shell dpm set-device-owner $ADMIN_COMP 2>&1) -join "`n"
+        $r = (Run-Native $ADB "-s $serial shell dpm set-device-owner $ADMIN_COMP") -join "`n"
         if ($r -match "Success") {
             Ok "Device Owner set - keyboard will lock to foreground (no swipe-away)"
         } elseif ($r -match "already") {
@@ -246,8 +258,8 @@ if ($SkipEmulator) {
         } else {
             Warn "Could not set Device Owner (an account may exist on the AVD). Kiosk disabled. Detail: $r"
         }
-        & $ADB -s $serial shell am force-stop com.gboardrelay 2>&1 | Out-Null
-        & $ADB -s $serial shell am start -n com.gboardrelay/.MainActivity 2>&1 | Out-Null
+        Run-Native $ADB "-s $serial shell am force-stop com.gboardrelay" | Out-Null
+        Run-Native $ADB "-s $serial shell am start -n com.gboardrelay/.MainActivity" | Out-Null
     } else { Warn "Skipping kiosk (-SkipKiosk)" }
 }
 
