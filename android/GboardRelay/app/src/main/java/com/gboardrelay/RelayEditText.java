@@ -68,6 +68,19 @@ public class RelayEditText extends EditText {
      *  panel (arrows / Select / Copy / Cut grey out on an empty field). */
     private boolean shadowMode = false;
     private static final int SHADOW_PAD = 40;   // spaces each side of the caret
+    /** True while Gboard holds a selection over the shadow padding (its swipe-on-
+     *  backspace gesture SELECTS the fake spaces first: setSelection(a,b), then
+     *  collapses, then deletes). That selection exists only in the relay — Windows
+     *  has no idea — so the collapse that follows must NOT be forwarded as a caret
+     *  jump, and the delete must NOT be forwarded per-char (40 fake spaces would
+     *  become 40 real backspaces — the exact bug where a swipe-backspace nuked text
+     *  far from the caret). */
+    private boolean shadowFakeSel = false;
+    /** One-shot: the last collapsed setSelection consumed a fake-padding selection
+     *  (i.e. we're mid swipe-on-backspace gesture). While set, the delete that
+     *  follows is BACKWARD-intent even if Gboard phrases it as an afterLength
+     *  (collapse-to-START variant). Cleared by the delete that consumes it. */
+    private boolean shadowGestureDelete = false;
     /** Trim the buffer once it gets long, but only at a word boundary. */
     private static final int TRIM_AT = 800, TRIM_KEEP = 400;
 
@@ -95,6 +108,7 @@ public class RelayEditText extends EditText {
         composing = "";
         shadowMode = false;
         winSelection = false;
+        shadowFakeSel = false;
         icHandled = true;
         try { setText(""); } finally { icHandled = false; }
         prevText = "";
@@ -110,6 +124,7 @@ public class RelayEditText extends EditText {
     public void enterShadowBuffer() {
         composing = "";
         winSelection = false;
+        shadowFakeSel = false;
         icHandled = true;
         try {
             char[] sp = new char[SHADOW_PAD * 2];
@@ -122,6 +137,29 @@ public class RelayEditText extends EditText {
         shadowMode = true;
     }
 
+    /** Shadow mode: deletes/arrows consume the padding; once it runs low, silently
+     *  re-install centered padding so Gboard's editing panel stays enabled and the
+     *  caret keeps headroom on both sides. Purely local — nothing is sent to
+     *  Windows, and the watcher is muted via icHandled. Skipped mid-compose or
+     *  mid-fake-selection so we never yank state out from under Gboard. */
+    private void maybeRecenterShadow() {
+        if (!shadowMode || !composing.isEmpty() || shadowFakeSel) return;
+        Editable e = getText();
+        int len = e != null ? e.length() : 0;
+        int caret = Math.max(0, getSelectionStart());
+        if (len < 16 || caret < 8 || len - caret < 8) {
+            icHandled = true;
+            try {
+                char[] sp = new char[SHADOW_PAD * 2];
+                java.util.Arrays.fill(sp, ' ');
+                String s = new String(sp);
+                setText(s);
+                setSelection(SHADOW_PAD, SHADOW_PAD);
+            } finally { icHandled = false; }
+            prevText = getText() != null ? getText().toString() : "";
+        }
+    }
+
     /** Called on SYNC: from the Windows host — replaces buffer with the current
      *  Windows field text and positions the cursor to match.
      *  Guarded with icHandled so the TextWatcher doesn't relay the setText back. */
@@ -129,6 +167,7 @@ public class RelayEditText extends EditText {
         composing = "";
         shadowMode = false;
         winSelection = false;
+        shadowFakeSel = false;
         icHandled = true;
         try {
             setText(text);
@@ -212,6 +251,21 @@ public class RelayEditText extends EditText {
                 && oldT.charAt(oldLen - 1 - s) == newT.charAt(newLen - 1 - s)) s++;
         int delCount = oldLen - p - s;   // chars removed
         int addCount = newLen - p - s;   // chars inserted
+        if (shadowMode) {
+            // External edit over the FAKE padding (a Gboard delete path we didn't
+            // intercept). The counts describe fake spaces, not real Windows text:
+            // 1 -> one backspace, >1 -> the word gesture -> one delete-word-left.
+            if (delCount == 1)     sendDel(1);
+            else if (delCount > 1) send("KEY:CTRL+BACKSPACE");
+            if (addCount > 0) sendText(newT.substring(p, newLen - s));
+            if (delCount > 0 || addCount > 0) {
+                Log.d(TAG, "external shadow edit del=" + delCount + " add=" + addCount);
+                composing = "";
+                shadowFakeSel = false;
+                post(this::maybeRecenterShadow);
+            }
+            return;
+        }
         if (delCount > 0) {
             Log.d(TAG, "external delete del=" + delCount + " add=" + addCount
                     + " (swipe/gesture delete)");
@@ -272,6 +326,15 @@ public class RelayEditText extends EditText {
                     // delete (empty commit) one backspace collapses the selection.
                     if (text.length() == 0) sendDel(1);
                     sendText(text);
+                } else if (sel > 0 && shadowMode) {
+                    // Selection over the FAKE shadow padding (swipe-on-backspace
+                    // gesture). Windows has no such selection, so per-char deletes
+                    // would eat real text. Translate a pure delete into ONE
+                    // delete-word-left; a replacement just types the new text.
+                    if (text.length() == 0) send("KEY:CTRL+BACKSPACE");
+                    sendText(text);
+                    shadowFakeSel = false;
+                    shadowGestureDelete = false;
                 } else {
                     sendDel(sel);
                     sendText(text);
@@ -296,8 +359,9 @@ public class RelayEditText extends EditText {
                 // composing char replaces it there by itself — no deletes needed.
                 if (composing.length() == 0) {
                     int sel = selectionLen();
-                    if (sel > 0 && !winSelection) { sendDel(sel); }
+                    if (sel > 0 && !winSelection && !shadowMode) { sendDel(sel); }
                     winSelection = false;
+                    shadowFakeSel = false;
                 }
                 replaceComposing(text.toString());
                 icHandled = true;
@@ -330,7 +394,35 @@ public class RelayEditText extends EditText {
             @Override
             public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                 Log.d(TAG, "deleteSurroundingText(" + beforeLength + "," + afterLength
-                        + ") sel=" + selectionLen());
+                        + ") sel=" + selectionLen() + " shadow=" + shadowMode);
+                if (shadowMode) {
+                    // The counts refer to FAKE padding spaces, not real Windows text.
+                    // A single tap (1) maps 1:1 to one backspace/delete; anything
+                    // larger is the swipe-on-backspace word gesture -> ONE
+                    // delete-word-left (Ctrl+Backspace), never N real deletes.
+                    // If this delete consumes the gesture's collapsed selection
+                    // (shadowGestureDelete), even an afterLength phrasing means the
+                    // user swiped BACKSPACE - keep the intent backward.
+                    if (beforeLength == 1)     sendDel(1);
+                    else if (beforeLength > 1) send("KEY:CTRL+BACKSPACE");
+                    if (afterLength > 0 && shadowGestureDelete) {
+                        if (afterLength == 1) sendDel(1);
+                        else                  send("KEY:CTRL+BACKSPACE");
+                    } else if (afterLength == 1) {
+                        send("KEY:DELETE");
+                    } else if (afterLength > 1) {
+                        send("KEY:CTRL+DELETE");
+                    }
+                    shadowGestureDelete = false;
+                    shadowFakeSel = false;
+                    composing = "";
+                    icHandled = true;
+                    try {
+                        boolean r = super.deleteSurroundingText(beforeLength, afterLength);
+                        post(RelayEditText.this::maybeRecenterShadow);
+                        return r;
+                    } finally { icHandled = false; }
+                }
                 // Backspace and swipe-delete of trailing text.
                 sendDel(beforeLength);
                 for (int i = 0; i < afterLength; i++) send("KEY:DELETE");
@@ -344,8 +436,31 @@ public class RelayEditText extends EditText {
             @Override
             public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
                 Log.d(TAG, "deleteSurroundingTextInCodePoints(" + beforeLength + ","
-                        + afterLength + ")");
+                        + afterLength + ") shadow=" + shadowMode);
+                if (shadowMode) {
+                    // Same fake-padding translation as deleteSurroundingText.
+                    if (beforeLength == 1)     sendDel(1);
+                    else if (beforeLength > 1) send("KEY:CTRL+BACKSPACE");
+                    if (afterLength > 0 && shadowGestureDelete) {
+                        if (afterLength == 1) sendDel(1);
+                        else                  send("KEY:CTRL+BACKSPACE");
+                    } else if (afterLength == 1) {
+                        send("KEY:DELETE");
+                    } else if (afterLength > 1) {
+                        send("KEY:CTRL+DELETE");
+                    }
+                    shadowGestureDelete = false;
+                    shadowFakeSel = false;
+                    composing = "";
+                    icHandled = true;
+                    try {
+                        boolean r = super.deleteSurroundingTextInCodePoints(beforeLength, afterLength);
+                        post(RelayEditText.this::maybeRecenterShadow);
+                        return r;
+                    } finally { icHandled = false; }
+                }
                 sendDel(beforeLength);
+                for (int i = 0; i < afterLength; i++) send("KEY:DELETE");
                 composing = "";
                 icHandled = true;
                 try { return super.deleteSurroundingTextInCodePoints(beforeLength, afterLength); }
@@ -373,9 +488,22 @@ public class RelayEditText extends EditText {
                     // A non-collapsed setSelection is a RELAY-ONLY selection (swipe-
                     // delete highlight, drag handles) — it is NOT mirrored on Windows.
                     winSelection = false;
+                    if (shadowMode) shadowFakeSel = true;
                 }
                 if (!icHandled && start == end) {
                     winSelection = false;           // collapsed on both sides
+                    if (shadowMode && shadowFakeSel) {
+                        // Collapse step of Gboard's swipe-on-backspace gesture over the
+                        // FAKE padding selection. Windows never saw that selection, so
+                        // forwarding this as a caret move (RIGHT*k / Ctrl+End) would
+                        // shift the real caret before the delete lands — the forward-
+                        // delete bug. Swallow it and mark the gesture so the delete
+                        // that follows is treated as BACKWARD-intent regardless of
+                        // which side Gboard collapsed to.
+                        shadowFakeSel = false;
+                        shadowGestureDelete = true;
+                        return super.setSelection(start, end);
+                    }
                     int delta = start - curPos;
                     if (delta != 0) {
                         int len = getText() != null ? getText().length() : 0;
@@ -420,6 +548,19 @@ public class RelayEditText extends EditText {
                         // aren't double-relayed.
                         winSelection = (meta & KeyEvent.META_SHIFT_ON) != 0;
                     } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
+                        if (selectionLen() > 0 && shadowMode) {
+                            // DEL over a FAKE padding selection (alternate swipe-delete
+                            // path): one word-delete on Windows, swallow the local edit.
+                            send("KEY:CTRL+BACKSPACE");
+                            shadowFakeSel = false;
+                            winSelection = false;
+                            icHandled = true;
+                            try {
+                                boolean r = super.sendKeyEvent(event);
+                                post(RelayEditText.this::maybeRecenterShadow);
+                                return r;
+                            } finally { icHandled = false; }
+                        }
                         if (selectionLen() > 0 && winSelection) {
                             // Backspace over a MIRRORED selection: one backspace deletes
                             // the whole selection on Windows. Apply the same one-key
@@ -476,6 +617,7 @@ public class RelayEditText extends EditText {
             public boolean commitCompletion(CompletionInfo text) {
                 Log.d(TAG, "commitCompletion(" + (text != null ? text.getText() : null) + ")");
                 int del = composing.length() > 0 ? composing.length() : selectionLen();
+                if (shadowMode && composing.length() == 0) del = 0;  // fake selection
                 sendDel(del);
                 if (text != null) sendText(text.getText());
                 composing = "";
