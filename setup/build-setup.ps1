@@ -25,7 +25,7 @@ $stage = Join-Path $env:TEMP ("gboardime-stage-" + [guid]::NewGuid().ToString("N
 New-Item -ItemType Directory -Force $stage | Out-Null
 
 $files = @(
-    "install.ps1","launch.ps1","stop.ps1","Install.cmd","README.md",
+    "install.ps1","launch.ps1","stop.ps1","watchdog.ps1","Install.cmd","README.md",
     "windows\gboard_host.py","windows\GboardRelay.apk","windows\debloat_removed_packages.txt",
     "assets\GboardIME.ico","assets\icon.png"
 )
