@@ -67,6 +67,18 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
+# 1b. Signal the watchdog to stand down BEFORE killing the host, else it would
+#     just relaunch it. Remove the marker (watchdog exits on its next tick) and
+#     kill the watchdog process now so it can't race us.
+$marker = "$env:LOCALAPPDATA\GboardIME\running.flag"
+Remove-Item $marker -Force -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*watchdog.ps1*' } |
+    ForEach-Object {
+        Log "stopping watchdog (pid $($_.ProcessId))"
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
 # 2. Kill the Windows host (console or windowless) ----------------------------
 $killed = 0
 foreach ($name in 'python.exe','pythonw.exe') {

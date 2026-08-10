@@ -96,4 +96,19 @@ if(Test-Path $PYTHONW){
 } else {
     Start-Process python -ArgumentList "`"$HOSTPY`"" -WindowStyle Minimized
 }
+
+# 7. Watchdog: mark "should be running" and start the PowerShell watchdog that
+#    relaunches the host if it gets killed (e.g. collateral python kills). The
+#    marker gates it so an intentional Quit (stop.ps1 removes the marker) is not
+#    fought. stop.ps1 also kills the watchdog.
+$state = "$env:LOCALAPPDATA\GboardIME"
+New-Item -ItemType Directory -Force $state | Out-Null
+Set-Content -Path "$state\running.flag" -Value "1" -Encoding ASCII
+$already = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+           Where-Object { $_.CommandLine -like '*watchdog.ps1*' }
+if (-not $already) {
+    Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+        "-NoProfile","-ExecutionPolicy","Bypass","-File","`"$ROOT\watchdog.ps1`"")
+    Log "Watchdog started (auto-restarts the host if it dies)."
+}
 Log "GboardIME is running. Ctrl+Alt+K toggles the keyboard; right-click the tray icon for options."
