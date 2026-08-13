@@ -67,7 +67,18 @@ public class RelayEditText extends EditText {
      *  content never leaks to Windows; it only exists so Gboard enables its editing
      *  panel (arrows / Select / Copy / Cut grey out on an empty field). */
     private boolean shadowMode = false;
-    private static final int SHADOW_PAD = 40;   // spaces each side of the caret
+    // Shadow padding is built from INVISIBLE FAKE WORDS, not a flat run of spaces.
+    // Rationale: Gboard's swipe-on-backspace deletes by WORD. A flat whitespace run
+    // has no word boundaries, so Gboard selects the entire run and the "how many
+    // words did the user swipe" information is destroyed before we ever see it -
+    // every swipe collapsed to a single Ctrl+Backspace on Windows. Using NBSP
+    // (U+00A0) as the word BODY and a real space as the SEPARATOR gives the buffer
+    // real token structure while still rendering completely blank, so we can count
+    // the fake words consumed and forward exactly that many word-deletes.
+    private static final char SHADOW_CH = (char) 0x00A0;  // NBSP: renders blank,
+    // but is NOT whitespace, so it forms a real word token for Gboard.
+    private static final int SHADOW_WORD_LEN = 4;
+    private static final int SHADOW_WORDS = 12;   // fake words each side of the caret
     /** True while Gboard holds a selection over the shadow padding (its swipe-on-
      *  backspace gesture SELECTS the fake spaces first: setSelection(a,b), then
      *  collapses, then deletes). That selection exists only in the relay — Windows
@@ -114,6 +125,68 @@ public class RelayEditText extends EditText {
         prevText = "";
     }
 
+    /** Build the invisible word-structured padding and centre the caret. Returns the
+     *  caret offset. Caller must guard with icHandled. */
+    private int installShadowPadding() {
+        char[] w = new char[SHADOW_WORD_LEN];
+        java.util.Arrays.fill(w, SHADOW_CH);
+        String word = new String(w);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < SHADOW_WORDS; i++) { sb.append(word).append(' '); }
+        int caret = sb.length();              // caret sits just after a separator
+        for (int i = 0; i < SHADOW_WORDS; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(word);
+        }
+        setText(sb.toString());
+        setSelection(caret, caret);
+        return caret;
+    }
+
+    /** Number of whitespace-delimited tokens in [from,to) of the current buffer.
+     *  Used to translate a fake-padding deletion into the equivalent number of
+     *  real word-deletes on Windows. */
+    private int countShadowWords(CharSequence e, int from, int to) {
+        if (e == null) return 0;
+        int len = e.length();
+        from = Math.max(0, Math.min(from, len));
+        to   = Math.max(0, Math.min(to,   len));
+        if (from >= to) return 0;
+        int words = 0;
+        boolean inWord = false;
+        for (int i = from; i < to; i++) {
+            boolean sep = (e.charAt(i) == ' ');   // NBSP is deliberately NOT a separator
+            if (!sep && !inWord) { words++; inWord = true; }
+            else if (sep) { inWord = false; }
+        }
+        return words;
+    }
+
+    /** Emit the Windows-side equivalent of deleting a run of fake padding that
+     *  spanned `words` fake words: one backspace for a single char, otherwise one
+     *  Ctrl+Backspace per word, so MULTI-WORD swipe-delete keeps working.
+     *
+     *  `from`/`to` bound the deleted region so we can detect the dangerous case:
+     *  if the region runs to the very edge of the buffer, Gboard may have selected
+     *  "everything on this side" rather than the N words the user actually swiped
+     *  (that is exactly what it did with the old flat-whitespace padding). We cannot
+     *  tell those apart, so we CLAMP to one word - deleting too little is trivially
+     *  recoverable, deleting too much is not. Normal swipes never hit the edge
+     *  because maybeRecenterShadow keeps several words of headroom on both sides. */
+    private void sendShadowDelete(CharSequence src, int from, int to, boolean forward) {
+        int chars = to - from;
+        if (chars <= 0) return;
+        if (chars == 1) { if (forward) send("KEY:DELETE"); else sendDel(1); return; }
+        int words = countShadowWords(src, from, to);
+        int len = src != null ? src.length() : 0;
+        boolean hitEdge = (from <= 0) || (to >= len);
+        int n = hitEdge ? 1 : Math.max(1, Math.min(words, SHADOW_WORDS));
+        String key = forward ? "KEY:CTRL+DELETE" : "KEY:CTRL+BACKSPACE";
+        send(n > 1 ? key + "*" + n : key);
+        Log.d(TAG, "shadow delete chars=" + chars + " words=" + words
+                + " hitEdge=" + hitEdge + " -> " + n + (forward ? " fwd" : " back"));
+    }
+
     /** Host CLEAR (caret repositioned in Windows, content unknown): instead of a
      *  truly empty buffer — which makes Gboard GREY OUT its whole editing panel —
      *  install invisible shadow padding (spaces) with the caret centered. Gboard
@@ -126,13 +199,7 @@ public class RelayEditText extends EditText {
         winSelection = false;
         shadowFakeSel = false;
         icHandled = true;
-        try {
-            char[] sp = new char[SHADOW_PAD * 2];
-            java.util.Arrays.fill(sp, ' ');
-            String s = new String(sp);
-            setText(s);
-            setSelection(SHADOW_PAD, SHADOW_PAD);
-        } finally { icHandled = false; }
+        try { installShadowPadding(); } finally { icHandled = false; }
         prevText = getText() != null ? getText().toString() : "";
         shadowMode = true;
     }
@@ -147,15 +214,13 @@ public class RelayEditText extends EditText {
         Editable e = getText();
         int len = e != null ? e.length() : 0;
         int caret = Math.max(0, getSelectionStart());
-        if (len < 16 || caret < 8 || len - caret < 8) {
+        // Keep at least a few fake words of headroom on BOTH sides, so a long
+        // multi-word swipe always has padding to consume and the panel stays live.
+        int leftWords  = countShadowWords(e, 0, caret);
+        int rightWords = countShadowWords(e, caret, len);
+        if (leftWords < 4 || rightWords < 4) {
             icHandled = true;
-            try {
-                char[] sp = new char[SHADOW_PAD * 2];
-                java.util.Arrays.fill(sp, ' ');
-                String s = new String(sp);
-                setText(s);
-                setSelection(SHADOW_PAD, SHADOW_PAD);
-            } finally { icHandled = false; }
+            try { installShadowPadding(); } finally { icHandled = false; }
             prevText = getText() != null ? getText().toString() : "";
         }
     }
@@ -164,6 +229,12 @@ public class RelayEditText extends EditText {
      *  Windows field text and positions the cursor to match.
      *  Guarded with icHandled so the TextWatcher doesn't relay the setText back. */
     public void syncFromHost(String text, int selStart, int selEnd) {
+        // An EMPTY sync means the host either read an empty Windows field or could
+        // not read it at all (common for Electron/Chromium targets). Either way an
+        // empty relay buffer would grey out Gboard's whole editing panel, so fall
+        // back to the invisible shadow padding instead - the panel stays usable and
+        // every operation is still relayed relatively.
+        if (text == null || text.isEmpty()) { enterShadowBuffer(); return; }
         composing = "";
         shadowMode = false;
         winSelection = false;
@@ -253,10 +324,10 @@ public class RelayEditText extends EditText {
         int addCount = newLen - p - s;   // chars inserted
         if (shadowMode) {
             // External edit over the FAKE padding (a Gboard delete path we didn't
-            // intercept). The counts describe fake spaces, not real Windows text:
-            // 1 -> one backspace, >1 -> the word gesture -> one delete-word-left.
-            if (delCount == 1)     sendDel(1);
-            else if (delCount > 1) send("KEY:CTRL+BACKSPACE");
+            // intercept). The counts describe fake padding, not real Windows text.
+            // Count the fake WORDS that vanished (oldT is the pre-edit buffer) and
+            // forward that many word-deletes, so a multi-word swipe stays multi-word.
+            if (delCount > 0) sendShadowDelete(oldT, p, oldLen - s, false);
             if (addCount > 0) sendText(newT.substring(p, newLen - s));
             if (delCount > 0 || addCount > 0) {
                 Log.d(TAG, "external shadow edit del=" + delCount + " add=" + addCount);
@@ -329,9 +400,13 @@ public class RelayEditText extends EditText {
                 } else if (sel > 0 && shadowMode) {
                     // Selection over the FAKE shadow padding (swipe-on-backspace
                     // gesture). Windows has no such selection, so per-char deletes
-                    // would eat real text. Translate a pure delete into ONE
-                    // delete-word-left; a replacement just types the new text.
-                    if (text.length() == 0) send("KEY:CTRL+BACKSPACE");
+                    // would eat real text. Forward one word-delete per fake WORD the
+                    // selection covers; a replacement just types the new text.
+                    if (text.length() == 0) {
+                        int a = Math.min(getSelectionStart(), getSelectionEnd());
+                        int b = Math.max(getSelectionStart(), getSelectionEnd());
+                        sendShadowDelete(getText(), a, b, false);
+                    }
                     sendText(text);
                     shadowFakeSel = false;
                     shadowGestureDelete = false;
@@ -403,15 +478,14 @@ public class RelayEditText extends EditText {
                     // If this delete consumes the gesture's collapsed selection
                     // (shadowGestureDelete), even an afterLength phrasing means the
                     // user swiped BACKSPACE - keep the intent backward.
-                    if (beforeLength == 1)     sendDel(1);
-                    else if (beforeLength > 1) send("KEY:CTRL+BACKSPACE");
-                    if (afterLength > 0 && shadowGestureDelete) {
-                        if (afterLength == 1) sendDel(1);
-                        else                  send("KEY:CTRL+BACKSPACE");
-                    } else if (afterLength == 1) {
-                        send("KEY:DELETE");
-                    } else if (afterLength > 1) {
-                        send("KEY:CTRL+DELETE");
+                    int caret = Math.max(0, getSelectionStart());
+                    if (beforeLength > 0) {
+                        sendShadowDelete(getText(), caret - beforeLength, caret, false);
+                    }
+                    if (afterLength > 0) {
+                        // Mid-gesture, an afterLength phrasing still means the user
+                        // swiped BACKSPACE -> keep the direction backward.
+                        sendShadowDelete(getText(), caret, caret + afterLength, !shadowGestureDelete);
                     }
                     shadowGestureDelete = false;
                     shadowFakeSel = false;
@@ -439,15 +513,12 @@ public class RelayEditText extends EditText {
                         + afterLength + ") shadow=" + shadowMode);
                 if (shadowMode) {
                     // Same fake-padding translation as deleteSurroundingText.
-                    if (beforeLength == 1)     sendDel(1);
-                    else if (beforeLength > 1) send("KEY:CTRL+BACKSPACE");
-                    if (afterLength > 0 && shadowGestureDelete) {
-                        if (afterLength == 1) sendDel(1);
-                        else                  send("KEY:CTRL+BACKSPACE");
-                    } else if (afterLength == 1) {
-                        send("KEY:DELETE");
-                    } else if (afterLength > 1) {
-                        send("KEY:CTRL+DELETE");
+                    int caret2 = Math.max(0, getSelectionStart());
+                    if (beforeLength > 0) {
+                        sendShadowDelete(getText(), caret2 - beforeLength, caret2, false);
+                    }
+                    if (afterLength > 0) {
+                        sendShadowDelete(getText(), caret2, caret2 + afterLength, !shadowGestureDelete);
                     }
                     shadowGestureDelete = false;
                     shadowFakeSel = false;
@@ -550,8 +621,11 @@ public class RelayEditText extends EditText {
                     } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
                         if (selectionLen() > 0 && shadowMode) {
                             // DEL over a FAKE padding selection (alternate swipe-delete
-                            // path): one word-delete on Windows, swallow the local edit.
-                            send("KEY:CTRL+BACKSPACE");
+                            // path): one word-delete per fake WORD covered, so a
+                            // multi-word swipe deletes multiple words on Windows.
+                            int a = Math.min(getSelectionStart(), getSelectionEnd());
+                            int b = Math.max(getSelectionStart(), getSelectionEnd());
+                            sendShadowDelete(getText(), a, b, false);
                             shadowFakeSel = false;
                             winSelection = false;
                             icHandled = true;
