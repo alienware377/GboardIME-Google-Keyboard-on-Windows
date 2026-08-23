@@ -10,6 +10,7 @@ import android.view.inputmethod.CompletionInfo;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 
 /**
@@ -92,6 +93,23 @@ public class RelayEditText extends EditText {
      *  follows is BACKWARD-intent even if Gboard phrases it as an afterLength
      *  (collapse-to-START variant). Cleared by the delete that consumes it. */
     private boolean shadowGestureDelete = false;
+    /** Tell the IME its editor context changed, so Gboard DISCARDS the word it is
+     *  currently composing and starts fresh against the new buffer.
+     *
+     *  Without this, resetting the buffer under an active composing word made Gboard
+     *  re-send that word with no delete -> the doubled-first-letter bug. Deferring
+     *  the reset until composing ended looked safer, but DEADLOCKS: Windows focus
+     *  changes never reach Android, so Gboard can keep a word composing forever and
+     *  the reposition was never applied at all - leaving a STALE buffer whose
+     *  leftover words then hijacked the next tap ("commands", "app"). restartInput
+     *  fixes both: the reset lands immediately AND Gboard drops the stale word. */
+    private void notifyImeReset() {
+        try {
+            InputMethodManager imm = (InputMethodManager)
+                    getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null) imm.restartInput(this);
+        } catch (Exception ignored) {}
+    }
     /** Trim the buffer once it gets long, but only at a word boundary. */
     private static final int TRIM_AT = 800, TRIM_KEEP = 400;
 
@@ -195,6 +213,13 @@ public class RelayEditText extends EditText {
      *  they act correctly on the real Windows text. The padding itself is never
      *  sent anywhere. */
     public void enterShadowBuffer() {
+        // NEVER reset mid-word. A CLEAR that lands while Gboard is composing (stray
+        // tap misread as a reposition, or one arriving during a glide) would wipe the
+        // composing tracker WITHOUT telling Windows about the prefix we already sent.
+        // Gboard then re-sends the whole word and the prefix is never deleted - the
+        // "doubled first letter" bug (ffliped, aalso, hnew). Skip instead: the word
+        // finishes cleanly and the next reposition CLEAR still lands.
+        boolean wasComposing = !composing.isEmpty();
         composing = "";
         winSelection = false;
         shadowFakeSel = false;
@@ -202,6 +227,8 @@ public class RelayEditText extends EditText {
         try { installShadowPadding(); } finally { icHandled = false; }
         prevText = getText() != null ? getText().toString() : "";
         shadowMode = true;
+        // Drop any half-composed word so it cannot be re-sent against the new buffer.
+        if (wasComposing) notifyImeReset();
     }
 
     /** Shadow mode: deletes/arrows consume the padding; once it runs low, silently
@@ -234,6 +261,9 @@ public class RelayEditText extends EditText {
         // empty relay buffer would grey out Gboard's whole editing panel, so fall
         // back to the invisible shadow padding instead - the panel stays usable and
         // every operation is still relayed relatively.
+        // Same rule as enterShadowBuffer: a SYNC that lands mid-word would silently
+        // drop the composing prefix already relayed to Windows and duplicate it.
+        boolean wasComposingSync = !composing.isEmpty();
         if (text == null || text.isEmpty()) { enterShadowBuffer(); return; }
         composing = "";
         shadowMode = false;
@@ -250,6 +280,7 @@ public class RelayEditText extends EditText {
             icHandled = false;
         }
         prevText = text;
+        if (wasComposingSync) notifyImeReset();
     }
 
     /** Called on CURSOR: from the Windows host — moves the Android cursor to match
@@ -463,6 +494,7 @@ public class RelayEditText extends EditText {
             public boolean finishComposingText() {
                 Log.d(TAG, "finishComposingText composing=" + composing);
                 composing = "";
+
                 return super.finishComposingText();
             }
 
@@ -489,7 +521,11 @@ public class RelayEditText extends EditText {
                     }
                     shadowGestureDelete = false;
                     shadowFakeSel = false;
-                    composing = "";
+                    // Track the composing region exactly as the normal path does -
+                    // blanking it here loses the prefix already sent to Windows and
+                    // duplicates it on the next composing update.
+                    if (beforeLength >= composing.length()) composing = "";
+                    else composing = composing.substring(0, composing.length() - beforeLength);
                     icHandled = true;
                     try {
                         boolean r = super.deleteSurroundingText(beforeLength, afterLength);

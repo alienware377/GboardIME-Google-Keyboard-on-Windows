@@ -651,6 +651,22 @@ def _apply_crop_region(hwnd):
     except Exception:
         pass
 
+DOCK_MARGIN = 10   # gap from the work-area edges when docked
+
+def _work_area():
+    """Primary display work area (screen minus taskbar/appbars), physical px.
+    We are per-monitor DPI aware, so these are real pixels on any display."""
+    try:
+        r = _RECT()
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            if r.right > r.left and r.bottom > r.top:
+                return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    sw = ctypes.windll.user32.GetSystemMetrics(0)
+    sh = ctypes.windll.user32.GetSystemMetrics(1)
+    return 0, 0, sw, sh
+
 def _position_emulator():
     """Place + size the emulator at the bottom-right, applying the crop band so the
     VISIBLE part (input box + Gboard) ends at the bottom of the screen."""
@@ -663,16 +679,29 @@ def _position_emulator():
     scale = _window_scale(hwnd)
     w = int(_emulator_size[0] * scale)
     h = int(_emulator_size[1] * scale)
-    sw = ctypes.windll.user32.GetSystemMetrics(0)   # SM_CXSCREEN (physical now)
-    sh = ctypes.windll.user32.GetSystemMetrics(1)   # SM_CYSCREEN (physical now)
+    # Dock inside the WORK AREA, not the raw screen: the work area excludes the
+    # taskbar, so the keyboard never sits under it. (The old code used the full
+    # screen height with a hardcoded 50px gap, which is smaller than the taskbar
+    # on a scaled display - at 200% it is ~96px - so the window covered it.)
+    wl, wt, wr, wb = _work_area()
+    aw_max, ah_max = (wr - wl) - 2 * DOCK_MARGIN, (wb - wt) - 2 * DOCK_MARGIN
+    # Clamp so a tall AVD (or a small screen) can never exceed the usable area.
+    w = max(120, min(w, aw_max))
+    h = max(120, min(h, ah_max))
     # First set the requested width; the emulator aspect-locks the height itself.
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), sw - w - 10, sh - h - 50,
-                  w, h, SWP_NOACTIVATE)
-    # Re-read the ACTUAL size Qt settled on, then dock bottom-right by that size so
-    # the (visible) bottom edge sits at sh-50.
+    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
+                  wr - w - DOCK_MARGIN, wb - h - DOCK_MARGIN, w, h, SWP_NOACTIVATE)
+    # Re-read the ACTUAL size Qt settled on (aspect lock may have changed the
+    # height), clamp again, then dock bottom-right by that real size.
     aw, ah, _, _ = _window_geometry(hwnd)
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), sw - aw - 10, sh - ah - 50,
-                  aw, ah, SWP_NOACTIVATE)
+    if ah > ah_max:
+        # Too tall for the work area: shrink by width and let Qt re-lock the aspect.
+        w = max(120, int(w * (ah_max / float(ah))))
+        _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
+                      wr - w - DOCK_MARGIN, wt + DOCK_MARGIN, w, ah_max, SWP_NOACTIVATE)
+        aw, ah, _, _ = _window_geometry(hwnd)
+    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
+                  wr - aw - DOCK_MARGIN, wb - ah - DOCK_MARGIN, aw, ah, SWP_NOACTIVATE)
     _apply_crop_region(hwnd)
 
 def _dock_emulator_bottom(w=None, h=None):
@@ -1459,6 +1488,43 @@ def _sync_field_to_android_thread():
                 pass
         if text is None:
             text = ""
+        # PLACEHOLDER GUARD. An EMPTY field often reports its placeholder as the
+        # text: Chromium/Electron surface it through TextPattern and as the node's
+        # Name/HelpText. Syncing that meant the relay buffer held e.g.
+        # "Type / for commands", so Gboard treated "commands" as a real trailing
+        # word and its first correction replaced the user's opening tap/swipe with
+        # it. Treat text that merely echoes the placeholder as an EMPTY field.
+        if text:
+            native = False
+            try:
+                native = ctrl.ControlTypeName in _EDITABLE_CTRLS
+            except Exception:
+                pass
+            if not native:
+                # Electron/Chromium contenteditable reached through the
+                # GroupControl-with-TextPattern fallback. Its text is NOT
+                # trustworthy: when the field is EMPTY it reports the rendered
+                # PLACEHOLDER ("Type / for commands"), which we then seeded into the
+                # relay buffer - Gboard treated the trailing "commands" as a real
+                # word and autocorrected the user's first tap/swipe into it. These
+                # wrappers also report page-relative caret offsets. Treat them as
+                # unreadable and let the shadow padding take over: the editing panel
+                # stays enabled and every relayed edit is relative anyway.
+                log(f"[sync] electron wrapper - text not trusted ({text.strip()[:32]!r})")
+                text = ""
+            else:
+                # Native field: a real <input>/<textarea> can still report its
+                # placeholder attribute via Name/HelpText. Ignore that too.
+                probe = text.strip()
+                for pid in (_UIA_NAME, _UIA_HELPTEXT):
+                    try:
+                        v = ctrl.GetPropertyValue(pid)
+                    except Exception:
+                        v = None
+                    if v and str(v).strip() == probe:
+                        log(f"[sync] placeholder ignored: {probe[:40]!r}")
+                        text = ""
+                        break
         # Cap: Android relay trims buffer at 800 chars; send last 4000 for context
         if len(text) > 4000:
             text = text[-4000:]
@@ -1500,6 +1566,8 @@ _UIA_LEGACY_ROLE  = 30095   # UIA_LegacyIAccessibleRolePropertyId
 _UIA_LEGACY_STATE = 30096   # UIA_LegacyIAccessibleStatePropertyId
 _UIA_ARIA_ROLE    = 30101   # UIA_AriaRolePropertyId
 _UIA_HAS_TEXTPATTERN = 30040   # UIA_IsTextPatternAvailablePropertyId
+_UIA_NAME            = 30005   # UIA_NamePropertyId
+_UIA_HELPTEXT        = 30013   # UIA_HelpTextPropertyId (placeholder for Chromium)
 _MSAA_ROLE_TEXT   = 42      # ROLE_SYSTEM_TEXT (selectable/editable text)
 _MSAA_STATE_READONLY = 0x40
 _ARIA_TEXT_ROLES  = {"textbox", "searchbox"}
@@ -1968,6 +2036,106 @@ _SIZES = [
     ("XLarge (560)", 560, 700),
 ]
 
+# ── Android screen height (hw.lcd.height) ────────────────────────────────────
+# DIFFERENT KNOB FROM "Keyboard size". Keyboard size rescales the whole emulator
+# WINDOW, but the emulator aspect-locks to the AVD's virtual screen, so the ratio
+# of keyboard to empty relay area never changes. The only way to change that ratio
+# - i.e. how tall the Android screen is, and therefore how much room the keyboard
+# rows get relative to the text box - is the AVD's hw.lcd.height, and that is only
+# read at COLD BOOT. So this writes config.ini and cold-restarts the emulator.
+_AVD_NAME   = "GboardIME_Root"
+_AVD_CONFIG = os.path.join(os.environ.get("USERPROFILE", ""), ".android", "avd",
+                           _AVD_NAME + ".avd", "config.ini")
+_EMULATOR_EXE = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk",
+                             "emulator", "emulator.exe")
+# Label -> hw.lcd.height in px. Width stays 1080; taller = more room above the
+# keyboard (and a bigger absolute keyboard), shorter = a tighter keyboard-only strip.
+_SCREEN_HEIGHTS = [
+    ("Shortest (900)",  900),
+    ("Short (1040)",   1040),
+    ("Default (1180)", 1180),
+    ("Tall (1320)",    1320),
+    ("Taller (1460)",  1460),
+    ("Tallest (1600)", 1600),
+]
+
+def _current_lcd_height():
+    try:
+        with open(_AVD_CONFIG, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.strip().startswith("hw.lcd.height="):
+                    return int(line.strip().split("=", 1)[1])
+    except Exception:
+        pass
+    return None
+
+def _write_lcd_height(px):
+    """Rewrite hw.lcd.height in the AVD config. Returns True on success."""
+    try:
+        with open(_AVD_CONFIG, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        out, found = [], False
+        for line in lines:
+            if line.strip().startswith("hw.lcd.height="):
+                out.append("hw.lcd.height=" + str(px) + chr(10)); found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append("hw.lcd.height=" + str(px) + chr(10))
+        with open(_AVD_CONFIG, "w", encoding="utf-8", newline=chr(10)) as f:
+            f.writelines(out)
+        return True
+    except Exception as e:
+        log(f"[height] failed to write config.ini: {e}")
+        return False
+
+def _restart_emulator_for_height(px):
+    """Cold-restart the emulator so the new hw.lcd.height takes effect, then put
+    the relay back together (tunnel + app). Runs on a worker thread."""
+    try:
+        log(f"[height] applying hw.lcd.height={px} (cold restart)")
+        # 1. stop the emulator (by process, never 'adb emu kill' - that can hang)
+        for name in ("qemu-system-x86_64.exe", "emulator.exe"):
+            subprocess.run(["taskkill", "/F", "/IM", name],
+                           capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        time.sleep(3)
+        # 2. relaunch cold with the SAME flags launch.ps1 uses (-writable-system is
+        #    required or the system Gboard overlay reverts; -gpu host or swipe lags).
+        args = [_EMULATOR_EXE, "-avd", _AVD_NAME,
+                "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
+                "-no-boot-anim", "-no-metrics", "-gpu", "host", "-memory", "2048"]
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # 3. wait for boot, then restore the link and the relay app
+        for _ in range(120):
+            time.sleep(5)
+            try:
+                r = subprocess.run([ADB_PATH, "-s", "emulator-5554", "shell",
+                                    "getprop", "sys.boot_completed"],
+                                   capture_output=True, text=True, timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if r.stdout.strip() == "1":
+                    break
+            except Exception:
+                pass
+        time.sleep(4)
+        setup_adb_reverse()
+        adb("shell", "am", "start", "-n", "com.gboardrelay/.MainActivity")
+        time.sleep(2)
+        _dock_emulator_bottom()
+        log(f"[height] done - screen is now 1080x{px}")
+    except Exception as e:
+        log(f"[height] restart failed: {e}")
+
+def _set_screen_height(px):
+    if _current_lcd_height() == px:
+        log(f"[height] already {px}")
+        return
+    if _write_lcd_height(px):
+        threading.Thread(target=_restart_emulator_for_height, args=(px,),
+                         daemon=True).start()
+
 # ── System tray icon ─────────────────────────────────────────────────────────
 def _make_icon_image():
     # Prefer the real app icon (assets/icon.png, repo root); fall back to the
@@ -2011,6 +2179,17 @@ def run_tray():
         pystray.MenuItem(label, size_action(w, h)) for (label, w, h) in _SIZES
     ])
 
+    def height_action(px):
+        return lambda icon, item: _set_screen_height(px)
+    def height_checked(px):
+        return lambda item: _current_lcd_height() == px
+
+    height_menu = pystray.Menu(*[
+        pystray.MenuItem(label, height_action(px), checked=height_checked(px),
+                         radio=True)
+        for (label, px) in _SCREEN_HEIGHTS
+    ])
+
     icon = pystray.Icon(
         "GboardIME",
         _make_icon_image(),
@@ -2021,6 +2200,7 @@ def run_tray():
             pystray.MenuItem("Start at boot",  on_boot, checked=boot_checked),
             pystray.MenuItem("Dock to bottom-right",          on_dock),
             pystray.MenuItem("Keyboard size", size_menu),
+            pystray.MenuItem("Screen height (restarts emulator)", height_menu),
             pystray.MenuItem("Re-apply ADB reverse",          on_adb),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit",                           on_quit),
