@@ -2101,10 +2101,11 @@ def _restart_emulator_for_height(px):
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         time.sleep(3)
         # 2. relaunch cold with the SAME flags launch.ps1 uses (-writable-system is
-        #    required or the system Gboard overlay reverts; -gpu host or swipe lags).
+        #    required or the system Gboard overlay reverts; angle_indirect because the
+        #    native GL translator stalls on draw-command issue and lags glide typing).
         args = [_EMULATOR_EXE, "-avd", _AVD_NAME,
                 "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
-                "-no-boot-anim", "-no-metrics", "-gpu", "host", "-memory", "2048"]
+                "-no-boot-anim", "-no-metrics", "-gpu", "angle_indirect", "-memory", "2048"]
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         # 3. wait for boot, then restore the link and the relay app

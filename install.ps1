@@ -10,7 +10,7 @@
     3. Creates the "GboardIME_Root" AVD and patches it to 1080x1180 @ 420dpi, host GPU.
     4. Installs the Python host dependencies.
     5. Installs the relay APK (prebuilt; builds from source only if the APK is missing).
-    6. Cold-boots the emulator (-writable-system -gpu host), sets Gboard as the default
+    6. Cold-boots the emulator (-writable-system -gpu angle_indirect), sets Gboard as default
        keyboard, sets the ADB reverse tunnel.
     7. Provisions kiosk / Lock Task mode (Device Owner) so the keyboard can't be swiped away.
     8. (Optional) debloats the emulator using windows/debloat_removed_packages.txt.
@@ -154,7 +154,7 @@ if (Test-Path $cfg) {
         "hw.lcd.height"           = "1180"
         "hw.lcd.density"          = "420"
         "hw.gpu.enabled"          = "yes"
-        "hw.gpu.mode"             = "host"
+        "hw.gpu.mode"             = "angle_indirect"
         "hw.keyboard"             = "no"
         "hw.ramSize"              = "2048"
         "disk.dataPartition.size" = "6G"
@@ -204,7 +204,7 @@ if ($SkipEmulator) {
         # Hidden launch (window style 0) so the emulator's noisy log console never
         # shows; the Android display (separate Qt window) still appears.
         $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-                   "-writable-system -no-boot-anim -no-metrics -gpu host -memory 2048"
+                   "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048"
         $wshRun = New-Object -ComObject WScript.Shell
         $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
         Info "Waiting for boot (up to 4 min)..."

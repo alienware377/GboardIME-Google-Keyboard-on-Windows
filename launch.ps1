@@ -41,6 +41,10 @@ if(-not $serial){
     # -no-snapshot-load forces a cold boot so the AVD's current hw.lcd resolution
     # (1080x1180 @ 420dpi) and host-GPU mode are always applied, instead of loading
     # a stale snapshot. -no-snapshot-save keeps it from persisting RAM state.
+    # -gpu angle_indirect (ANGLE/D3D11) NOT 'host': measured on an RTX 3090 Ti, the
+    # native GL translator stalled on 'issue draw commands' for 351 of 366 frames
+    # (95.9% jank, 48ms median), starving Gboard's glide sampler so swipes produced
+    # wrong words. ANGLE: 17ms median, 0 missed vsync, that stall gone entirely.
     # -writable-system is REQUIRED so the system Gboard 12.4 overlay stays in place;
     # without it the keyboard reverts to the stock preload state.
     #
@@ -48,7 +52,7 @@ if(-not $serial){
     # noisy console/log window never appears. The Android display (a separate Qt
     # window) still shows normally; only the text-log console is suppressed.
     $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-               "-writable-system -no-boot-anim -no-metrics -gpu host -memory 2048"
+               "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048"
     $wshRun = New-Object -ComObject WScript.Shell
     $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
     Log "Waiting for emulator to boot (up to 3 min)..."
