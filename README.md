@@ -77,7 +77,7 @@ shortcuts.
 - [Android Studio](https://developer.android.com/studio) / Android SDK (`platform-tools`, `emulator`)
 - A Java runtime (Android Studio bundles one at `jbr/`)
 - Python 3 (host uses `pystray`, `pillow`, `uiautomation` — installed by `setup.ps1`)
-- A CPU with virtualization enabled (for the x86_64 emulator) and a GPU (host-GPU mode is required for smooth swipe typing)
+- A CPU with virtualization enabled (for the x86_64 emulator) and a GPU (hardware acceleration is required for smooth swipe typing)
 
 ## Install
 
@@ -97,7 +97,7 @@ The installer is idempotent and does everything end-to-end:
 
 - downloads the Android SDK cmdline-tools / platform-tools / emulator if missing
 - installs the `google_apis` x86_64 API-34 system image (the rootable, non-Play-Store image)
-- creates the `GboardIME_Root` AVD and patches it to 1080x1180 @ 420dpi with host-GPU
+- creates the `GboardIME_Root` AVD and patches it to 1080x1180 @ 420dpi with ANGLE rendering
 - installs the Python host dependencies and the prebuilt relay APK
 - cold-boots the emulator, sets Gboard as the default keyboard, sets the ADB reverse tunnel
 - provisions kiosk / Lock Task mode (Device Owner) so the keyboard can't be swiped away
@@ -153,8 +153,25 @@ exact order. The host sends `SYNC:` whenever the Windows focus moves to a new te
 
 ## Notes & quirks
 
-- **Smooth swipe typing requires host-GPU mode.** Software rendering (SwiftShader) drops touch
-  samples mid-glide and produces wrong words. Launch the emulator with `-gpu host`.
+- **Smooth swipe typing needs `-gpu angle_indirect`** (what the installer and launcher set).
+  Gboard samples a glide once per frame, so a slow frame rate makes it misread the gesture and
+  emit the wrong word. Measured on this project, the native GL translator (`-gpu host`) stalled
+  on `Slow issue draw commands` for 351 of 366 frames — 95.9% jank, 48 ms median. ANGLE over
+  D3D11 gives a 17 ms median with zero missed vsync. Software rendering (SwiftShader) is worse
+  than both. The guest reports the same GL vendor string either way, so verify by measuring
+  (`adb shell dumpsys gfxinfo com.google.android.inputmethod.latin`), not by the vendor string.
+- **Glide typing with a tablet pen needs `QT_QPA_PLATFORM=windows:nowmpointer`** (also set by the
+  launcher). Windows delivers pen through `WM_POINTER` but mouse through legacy messages; on the
+  pointer path Qt 6.5 replays the stroke's buffered points and stamps each with the time it was
+  replayed rather than drawn. Gboard reads velocity and dwell from those timings, so pen strokes
+  decoded as the wrong word while mouse and finger were unaffected. Setting the option moved
+  same-instant point clumps from 66.3% to 2.0% of a stroke.
+  ⚠️ This option was **removed in Qt 6.8**, and the emulator suppresses Qt's unknown-option
+  warning — if the SDK ships a newer emulator, pen typing regresses silently. Re-test after
+  Android SDK updates.
+- **The Android navigation bar is hidden** (`-prop qemu.hw.mainkeys=1`), which gives the keyboard
+  back 63 px of window height. Kiosk mode already blocks Home and Recents, so the bar only cost
+  space.
 - **Gboard's keyboard height is capped at ~⅔ of the screen.** Presets and prefs can shrink it but
   not exceed that ceiling — this is baked into Gboard and not configurable around.
 - **Kiosk / Lock Task mode** keeps the keyboard locked to the foreground so it can't be
@@ -182,6 +199,18 @@ affiliated with or endorsed by Google.
 **Does this work with swipe / gesture typing?** Yes — that's the main reason it exists.
 Glide-typed words land in your Windows app exactly as Gboard would produce them on Android,
 including the auto-spacing and corrections.
+
+**Can I swipe-type with a tablet pen / stylus?** Yes. Pen strokes used to decode as the wrong
+word while mouse and finger worked fine; that was fixed by routing pen input away from the
+Windows pointer API, which was destroying the stroke's timing. Any Windows pen works — the fix
+is not specific to a vendor. If pen typing ever regresses after an Android SDK update, see the
+Qt 6.8 note under *Notes & quirks*.
+
+**Swipe typing picks the wrong words — what do I check?** Frame rate first. Gboard reconstructs
+a glide from per-frame samples, so anything that slows rendering makes it guess badly. Confirm
+the emulator is on `-gpu angle_indirect` and measure with
+`adb shell dumpsys gfxinfo com.google.android.inputmethod.latin` — you want a ~17 ms median and
+no `Slow issue draw commands`. If it only happens with a pen, see the pen note above.
 
 **Does it work on Windows 10? Windows 11?** Both. Any 64-bit Windows 10/11 with virtualization
 enabled (for the Android emulator) and a working GPU.
