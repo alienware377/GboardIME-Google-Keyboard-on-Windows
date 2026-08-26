@@ -208,6 +208,10 @@ if ($SkipEmulator) {
         $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
                    "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048 " +
                    "-prop qemu.hw.mainkeys=1"
+        # nowmpointer routes pen/touch through Qt's legacy WM_MOUSE path. Qt 6.5's
+        # WM_POINTER path replays the pen's coalesced history stamped with the CURRENT
+        # time, which destroys stroke timing and made glide typing pick wrong words.
+        $env:QT_QPA_PLATFORM = "windows:nowmpointer"
         $wshRun = New-Object -ComObject WScript.Shell
         $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
         Info "Waiting for boot (up to 4 min)..."

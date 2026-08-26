@@ -58,6 +58,20 @@ if(-not $serial){
     $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
                "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048 " +
                "-prop qemu.hw.mainkeys=1"
+    # QT_QPA_PLATFORM=windows:nowmpointer makes Qt handle pen/touch through the legacy
+    # WM_MOUSE path instead of WM_POINTER. This is the glide-typing fix for tablet pens.
+    # Qt 6.5's pointer path replays the pen's coalesced history in a tight loop and stamps
+    # every replayed point with the CURRENT time, so a stroke arrives as same-instant
+    # clumps separated by 100-350ms holes (measured: 66% of gaps under 0.1ms, 78% of
+    # stroke time stalled). Gboard derives velocity from point timing, so it read garbage
+    # and picked wrong words. Mouse was never affected because Qt already sends
+    # QT_PT_MOUSE down the legacy path - which is exactly the asymmetry we measured.
+    # WScript.Shell.Run inherits this process's environment, so setting it here is enough.
+    # NOTE: do NOT add 'nomousefromtouch' - it makes Qt drop synthesized pen events.
+    # NOTE: this option was REMOVED in Qt 6.8; if the SDK ships a newer emulator this
+    # silently stops working (the warning is suppressed by QT_LOGGING_RULES), so re-check
+    # pen behaviour after any SDK update.
+    $env:QT_QPA_PLATFORM = "windows:nowmpointer"
     $wshRun = New-Object -ComObject WScript.Shell
     $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
     Log "Waiting for emulator to boot (up to 3 min)..."

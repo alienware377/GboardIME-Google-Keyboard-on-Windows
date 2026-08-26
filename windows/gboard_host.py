@@ -2153,7 +2153,14 @@ def _restart_emulator_for_height(px):
                 "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
                 "-no-boot-anim", "-no-metrics", "-gpu", "angle_indirect", "-memory", "2048",
                 "-prop", "qemu.hw.mainkeys=1"]
+        #    QT_QPA_PLATFORM=windows:nowmpointer routes pen/touch through Qt's legacy
+        #    WM_MOUSE path. Qt 6.5's WM_POINTER path replays the pen's coalesced history
+        #    stamped with the CURRENT time, so strokes arrive as same-instant clumps and
+        #    glide typing picks wrong words. Must be set here too, or a height change
+        #    would silently relaunch the emulator without the fix.
+        _emu_env = dict(os.environ, QT_QPA_PLATFORM="windows:nowmpointer")
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=_emu_env,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         # 3. wait for boot, then restore the link and the relay app
         for _ in range(120):
