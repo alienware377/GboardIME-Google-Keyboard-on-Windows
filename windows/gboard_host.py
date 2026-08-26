@@ -72,6 +72,7 @@ def log(msg):
         pass
 
 # ── Windows API constants ────────────────────────────────────────────────────
+INPUT_MOUSE         = 0
 INPUT_KEYBOARD      = 1
 KEYEVENTF_UNICODE   = 0x0004
 KEYEVENTF_KEYUP     = 0x0002
@@ -208,8 +209,18 @@ class KEYBDINPUT(ctypes.Structure):
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
     ]
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx",          ctypes.wintypes.LONG),
+        ("dy",          ctypes.wintypes.LONG),
+        ("mouseData",   ctypes.wintypes.DWORD),
+        ("dwFlags",     ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
 class _INPUT_UNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT), ("_pad", ctypes.c_byte * 28)]
+    _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("_pad", ctypes.c_byte * 28)]
 
 class INPUT(ctypes.Structure):
     _fields_ = [("type", ctypes.wintypes.DWORD), ("u", _INPUT_UNION)]
@@ -1141,6 +1152,39 @@ def _click_watch_thread():
         except Exception as e:
             log(f"[click] watch error (continuing): {e!r}")
             time.sleep(0.3)
+
+
+# ── Pen glide typing: DO NOT re-add a low-level mouse hook ────────────────
+# 2026-08-25: an attempt to fix pen swipe lag by installing a WH_MOUSE_LL hook
+# here (swallow the pen-tagged event, re-emit it untagged via SendInput) FROZE
+# THE ENTIRE DESKTOP. Recording exactly why, because the diagnosis that led to
+# it was correct and the idea will look tempting again.
+#
+# What is true, and still measured:
+#   Windows delivers pen as synthesized legacy mouse tagged 0xFF515700 (bit 0x80
+#   = pen). At the hook it is pristine: 266 Hz, 0% batched, 0% stalled. Inside
+#   the guest the same stroke is ~140 Hz, 66% batched, 78% of time stalled. So
+#   the EMULATOR mangles pen input, and it handles plain mouse input perfectly
+#   (a synthetic 250 Hz drag arrived 201/200 points, 0% stalls).
+#
+# Why the hook fix is nonetheless unshippable:
+#   WH_MOUSE_LL is GLOBAL and SYNCHRONOUS. Every mouse/pen/touch event in the
+#   whole session is marshalled into THIS process and Windows blocks that input
+#   until the callback returns. The callback is Python, so it must take the GIL
+#   - and this host runs ~12 other threads, several doing UIA/COM calls that
+#   hold the GIL for hundreds of milliseconds. Every such call stalled all
+#   system input. Input to ELEVATED windows is exempt from a non-elevated
+#   process's hook (UIPI), which is why Task Manager stayed usable and nothing
+#   else did; that asymmetry is the signature of this bug, not a coincidence.
+#
+# Secondary faults in that attempt, for the record: no user-reachable kill
+# switch, so recovery needed a hard power-off; and dropped re-emissions turned
+# glides into single taps.
+#
+# If this is ever revisited, the hook must NOT live in this process. It needs a
+# tiny native (C) helper with no GIL, no COM, and no other threads, doing
+# nothing but the tag swap - or better, fix delivery on the emulator side
+# instead of intercepting Windows input at all.
 
 
 # ── Global touch-tap detection (Raw Input from the HID digitizer) ─────────────
@@ -2103,9 +2147,12 @@ def _restart_emulator_for_height(px):
         # 2. relaunch cold with the SAME flags launch.ps1 uses (-writable-system is
         #    required or the system Gboard overlay reverts; angle_indirect because the
         #    native GL translator stalls on draw-command issue and lags glide typing).
+        #    qemu.hw.mainkeys=1 suppresses the software nav bar (63px at 420dpi) - lock
+        #    task already blocks home/recents so it was pure wasted height.
         args = [_EMULATOR_EXE, "-avd", _AVD_NAME,
                 "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
-                "-no-boot-anim", "-no-metrics", "-gpu", "angle_indirect", "-memory", "2048"]
+                "-no-boot-anim", "-no-metrics", "-gpu", "angle_indirect", "-memory", "2048",
+                "-prop", "qemu.hw.mainkeys=1"]
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         # 3. wait for boot, then restore the link and the relay app
@@ -2211,6 +2258,16 @@ def run_tray():
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # 0. Single instance. A second host is not merely wasteful: it installs a
+    #    SECOND low-level mouse hook, so every pen event would be swallowed and
+    #    re-emitted twice. Racing launch.ps1 against the watchdog used to leave
+    #    two hosts alive, so this guard is load-bearing, not defensive polish.
+    #    Named mutex (never command-line matching, which misidentifies).
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\GboardIMEHost")
+    if ctypes.windll.kernel32.GetLastError() == 183:   # ERROR_ALREADY_EXISTS
+        log("[main] another host is already running - exiting")
+        sys.exit(0)
+
     # 1. Start TCP server
     t_srv = threading.Thread(target=server_thread, daemon=True)
     t_srv.start()

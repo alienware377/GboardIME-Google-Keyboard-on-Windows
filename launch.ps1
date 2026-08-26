@@ -51,8 +51,13 @@ if(-not $serial){
     # Launch via WScript.Shell.Run with window style 0 (hidden) so the emulator's
     # noisy console/log window never appears. The Android display (a separate Qt
     # window) still shows normally; only the text-log console is suppressed.
+    # -prop qemu.hw.mainkeys=1 tells the framework this device has hardware nav keys, so
+    # SystemUI never draws the software navigation bar. That reclaims 63px at 420dpi (the
+    # app area was 1080x1257 of a 1080x1320 screen). It is dead space in kiosk mode: lock
+    # task already blocks home/recents, so the bar only cost height.
     $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-               "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048"
+               "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048 " +
+               "-prop qemu.hw.mainkeys=1"
     $wshRun = New-Object -ComObject WScript.Shell
     $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
     Log "Waiting for emulator to boot (up to 3 min)..."

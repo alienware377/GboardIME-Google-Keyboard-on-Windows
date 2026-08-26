@@ -203,8 +203,11 @@ if ($SkipEmulator) {
     if (-not $serial) {
         # Hidden launch (window style 0) so the emulator's noisy log console never
         # shows; the Android display (separate Qt window) still appears.
+        # -prop qemu.hw.mainkeys=1 suppresses the software navigation bar (63px at 420dpi);
+        # lock task already blocks home/recents so the bar was pure wasted height.
         $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-                   "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048"
+                   "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048 " +
+                   "-prop qemu.hw.mainkeys=1"
         $wshRun = New-Object -ComObject WScript.Shell
         $wshRun.Run("`"$EMULATOR`" $emuArgs", 0, $false) | Out-Null
         Info "Waiting for boot (up to 4 min)..."
