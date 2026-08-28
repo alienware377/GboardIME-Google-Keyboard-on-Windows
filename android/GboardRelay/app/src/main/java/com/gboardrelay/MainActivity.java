@@ -73,6 +73,9 @@ public class MainActivity extends Activity {
         titleText  = findViewById(R.id.title_text);
         TextView exitKioskBtn = findViewById(R.id.exit_kiosk_btn);
         exitKioskBtn.setOnClickListener(v -> toggleKiosk(exitKioskBtn));
+        // Restore the dimmed look after a recreation (see kioskActive) so the button
+        // does not come back looking "on" while kiosk is actually off.
+        exitKioskBtn.setAlpha(kioskActive ? 1.0f : 0.5f);
         mainHandler = new Handler(Looper.getMainLooper());
         ioExecutor = Executors.newCachedThreadPool();
         sendExecutor = Executors.newSingleThreadExecutor();
@@ -81,7 +84,13 @@ public class MainActivity extends Activity {
         // delete, swipe-delete) straight to the Windows host — no fragile diff.
         inputField.setSender(this::sendCmd);
 
-        enterKioskMode();
+        // Only re-pin if the user has not deliberately left kiosk. Switching the
+        // navigation overlay is a CONFIGURATION CHANGE, so this activity is destroyed
+        // and recreated moments after the eject button turns kiosk off. Calling
+        // enterKioskMode() unconditionally here re-pinned it immediately, which made
+        // the button look like it did nothing (and left the next tap toggling the
+        // wrong way). kioskActive is static so it survives that recreation.
+        if (kioskActive) enterKioskMode();
         showKeyboard();
         connectLoop();
     }
@@ -122,7 +131,10 @@ public class MainActivity extends Activity {
 
     /** Tracks whether we're currently pinned in Lock Task mode (only meaningful when
      *  Device Owner). Toggled by the on-screen eject button. */
-    private boolean kioskActive = true;
+    /** STATIC on purpose: toggling the navigation overlay is a configuration change,
+     *  so this activity is recreated right after the eject button runs. A per-instance
+     *  field would reset to true on that recreation and the app would re-pin itself. */
+    private static boolean kioskActive = true;
 
     /** Toggle Lock Task (kiosk) mode from the on-screen eject button. Exiting lets
      *  Home / Recents / gesture-nav work again so the user can leave the app or move
@@ -136,10 +148,16 @@ public class MainActivity extends Activity {
             if (kioskActive) {
                 try { stopLockTask(); } catch (Exception ignored) {}
                 kioskActive = false;
+                // Leaving kiosk must also restore navigation GESTURES. They are forced
+                // off while pinned (three-button overlay) because with the navigation
+                // bar hidden the keyboard sits in the swipe-up-from-bottom home strip,
+                // and that gesture escapes Lock Task. Flipping the overlay needs shell
+                // permissions this app does not hold, so the Windows host does it for us.
+                sendCmd("NAV:GESTURE");
                 btn.setText("⏏");
                 btn.setAlpha(0.5f);
                 android.widget.Toast.makeText(this,
-                        owner ? "Kiosk off — Home/Recents enabled"
+                        owner ? "Kiosk off — Home/Recents gestures enabled"
                               : "Not in kiosk mode (not Device Owner)",
                         android.widget.Toast.LENGTH_SHORT).show();
             } else {
@@ -147,6 +165,8 @@ public class MainActivity extends Activity {
                     startLockTask();
                 }
                 kioskActive = true;
+                // Re-pinning: kill the gestures again, or the kiosk is escapable.
+                sendCmd("NAV:BUTTON");
                 btn.setText("⏏");
                 btn.setAlpha(1.0f);
                 android.widget.Toast.makeText(this,

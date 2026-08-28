@@ -391,6 +391,45 @@ def _inject_into_target(fn):
     _last_inject_time = time.time()
     fn()
 
+_NAV_GESTURAL   = "com.android.internal.systemui.navbar.gestural"
+_NAV_THREEBUTTON = "com.android.internal.systemui.navbar.threebutton"
+
+def _set_nav_mode(mode: str):
+    """Switch the navigation overlay. mode is 'GESTURE' or 'BUTTON'.
+
+    Always enable the wanted overlay AND explicitly disable the other one: enabling
+    one alone leaves both marked enabled, and which wins after a reboot is not
+    defined. Runs off the dispatch thread because each adb call takes ~100-300ms.
+    """
+    want, other = ((_NAV_GESTURAL, _NAV_THREEBUTTON) if mode == "GESTURE"
+                   else (_NAV_THREEBUTTON, _NAV_GESTURAL))
+    try:
+        for action, pkg in (("enable", want), ("disable", other)):
+            subprocess.run([ADB_PATH, "-s", "emulator-5554", "shell",
+                            "cmd", "overlay", action, pkg],
+                           capture_output=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        # The overlay change is applied ASYNCHRONOUSLY: navigation_mode still reads the
+        # old value for a moment after `cmd overlay` returns. Poll instead of reading
+        # once, or every toggle logs a warning that is simply wrong.
+        expect = "2" if mode == "GESTURE" else "0"
+        now = ""
+        for _ in range(12):                     # up to ~6s
+            r = subprocess.run([ADB_PATH, "-s", "emulator-5554", "shell",
+                                "settings", "get", "secure", "navigation_mode"],
+                               capture_output=True, text=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            now = (r.stdout or "").strip()
+            if now == expect:
+                break
+            time.sleep(0.5)
+        if now == expect:
+            log(f"[nav] {mode.lower()} navigation active (navigation_mode={now})")
+        else:
+            log(f"[nav] WARNING: asked for {mode}, navigation_mode={now!r} (expected {expect})")
+    except Exception as e:
+        log(f"[nav] failed to set {mode}: {e}")
+
 # ── Command dispatcher ───────────────────────────────────────────────────────
 def dispatch(cmd: str):
     cmd = cmd.rstrip("\r\n")   # only strip the line terminator — keep payload spaces
@@ -419,6 +458,21 @@ def dispatch(cmd: str):
                 log("[resync] Enter received -> resync armed")
         else:
             log(f"[key] unknown key spec: {spec!r}")
+    elif cmd.startswith("NAV:"):
+        # The relay app sends this when the kiosk (eject) button is toggled.
+        # While pinned we force THREE-BUTTON navigation, because the navigation bar is
+        # hidden (qemu.hw.mainkeys=1) and that puts the keyboard directly in the
+        # swipe-up-from-bottom home strip - a gesture that escapes Lock Task (the HOME
+        # key event is correctly blocked, but the quickstep gesture reaches the launcher
+        # first, and Android refuses app gesture-exclusion for the home gesture).
+        # Leaving kiosk restores the gestural overlay so Home/Recents work again.
+        # The app cannot flip overlays itself: `cmd overlay` needs CHANGE_OVERLAY_PACKAGES,
+        # a signature|privileged permission. The host has adb, so it does it here.
+        # NOTE: this restores GESTURES only. The visible bar cannot come back without a
+        # reboot - hasNavigationBar() is decided at display init, and it is measured that
+        # setprop qemu.hw.mainkeys 0 plus a SystemUI restart does NOT bring it back.
+        mode = cmd[4:].strip().upper()
+        threading.Thread(target=_set_nav_mode, args=(mode,), daemon=True).start()
     elif cmd.startswith("CROP:"):
         arg = cmd[5:].strip()
         log(f"[crop] CROP command received: arg={arg!r}")
