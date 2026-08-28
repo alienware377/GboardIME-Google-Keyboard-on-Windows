@@ -2192,6 +2192,18 @@ def _restart_emulator_for_height(px):
     the relay back together (tunnel + app). Runs on a worker thread."""
     try:
         log(f"[height] applying hw.lcd.height={px} (cold restart)")
+        # 0. Flush the guest page cache first. Gboard writes its learned-word
+        #    dictionary rarely, and killing the VM outright drops anything still
+        #    cached in the guest kernel - it never reaches userdata-qemu.img, so
+        #    learned words appear to reset. Bounded so a wedged guest cannot hang
+        #    the restart.
+        try:
+            subprocess.run([ADB_PATH, "-s", "emulator-5554", "shell", "sync"],
+                           capture_output=True, timeout=8,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            log("[height] guest filesystem synced")
+        except Exception as e:
+            log(f"[height] sync skipped: {e}")
         # 1. stop the emulator (by process, never 'adb emu kill' - that can hang)
         for name in ("qemu-system-x86_64.exe", "emulator.exe"):
             subprocess.run(["taskkill", "/F", "/IM", name],

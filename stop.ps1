@@ -98,6 +98,16 @@ if (Test-Path $ADB) {
     Log "force-stop relay: $(if($ok){'ok'}else{'TIMEOUT'})"
     $ok = Invoke-WithTimeout $ADB @('-s','emulator-5554','reverse','--remove-all') 3000
     Log "reverse --remove-all: $(if($ok){'ok'}else{'TIMEOUT'})"
+
+    # Flush the GUEST page cache before the VM is killed, or Gboard's learned words
+    # are lost. Gboard writes its user-history dictionary rarely and we kill
+    # qemu-system-x86_64 outright (step 4), so anything still sitting in the guest
+    # kernel's page cache never reaches userdata-qemu.img - the file looks written
+    # inside Android but the block never lands in the disk image. That reads to the
+    # user as "my learned words keep resetting".
+    # Timeout-wrapped like everything else here: Quit must never hang.
+    $ok = Invoke-WithTimeout $ADB @('-s','emulator-5554','shell','sync') 8000
+    Log "sync guest filesystem: $(if($ok){'ok'}else{'TIMEOUT'})"
 } else {
     Log "ADB not found at $ADB - skipping adb cleanup."
 }
