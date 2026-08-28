@@ -265,6 +265,20 @@ if ($SkipEmulator) {
         } else {
             Warn "Could not set Device Owner (an account may exist on the AVD). Kiosk disabled. Detail: $r"
         }
+        # Force THREE-BUTTON navigation. Hiding the navigation bar (qemu.hw.mainkeys=1)
+        # stops the bar being drawn but does NOT disable gesture navigation, and with the
+        # bar gone the keyboard sits directly in the swipe-up-from-bottom home strip.
+        # Swiping there escaped the kiosk to the empty launcher. Lock task cannot prevent
+        # it (the gesture reaches the launcher before the activity manager blocks it, and
+        # Android refuses app gesture-exclusion for the home gesture). Three-button mode
+        # has no such gesture, and mainkeys=1 still keeps the bar hidden.
+        # 'gestural' must be disabled explicitly - enabling threebutton alone leaves both
+        # overlays enabled and the winner after a reboot is not guaranteed.
+        Run-Native $ADB "-s $serial shell cmd overlay enable com.android.internal.systemui.navbar.threebutton" | Out-Null
+        Run-Native $ADB "-s $serial shell cmd overlay disable com.android.internal.systemui.navbar.gestural" | Out-Null
+        $nm = ((Run-Native $ADB "-s $serial shell settings get secure navigation_mode") -join "").Trim()
+        if ($nm -eq "0") { Ok "Navigation gestures disabled (three-button; bar stays hidden)" }
+        else { Warn "navigation_mode is '$nm', expected 0 - swipe-up home gesture may still work" }
         Run-Native $ADB "-s $serial shell am force-stop com.gboardrelay" | Out-Null
         Run-Native $ADB "-s $serial shell am start -n com.gboardrelay/.MainActivity" | Out-Null
     } else { Warn "Skipping kiosk (-SkipKiosk)" }

@@ -104,6 +104,24 @@ if(Test-Path $APK){
 & $ADB -s $serial reverse "tcp:$DEVICE_PORT" "tcp:$HOST_PORT" | Out-Null
 Log "ADB reverse set: device:$DEVICE_PORT -> host:$HOST_PORT"
 
+# 3b. Force THREE-BUTTON navigation so the swipe-up-from-bottom "home" gesture does
+# not exist. Hiding the navigation bar (-prop qemu.hw.mainkeys=1) does NOT disable
+# gesture navigation - it only stops the bar being drawn, which moved the keyboard
+# down into the home-gesture strip at the very bottom edge. Swiping up there left
+# the kiosk and showed the (empty) launcher.
+# Lock task does not save us: the quickstep gesture reaches the launcher before the
+# activity manager blocks it, and an app cannot opt out - Android caps gesture
+# exclusion regions and refuses them outright for the home gesture.
+# Three-button mode has no such gesture, and because mainkeys=1 still suppresses the
+# bar itself, we get neither a navigation bar nor navigation gestures.
+# Disable 'gestural' EXPLICITLY: enabling threebutton alone leaves both overlays
+# marked enabled, and which one wins after a reboot is not guaranteed.
+& $ADB -s $serial shell "cmd overlay enable com.android.internal.systemui.navbar.threebutton" 2>$null | Out-Null
+& $ADB -s $serial shell "cmd overlay disable com.android.internal.systemui.navbar.gestural" 2>$null | Out-Null
+$navMode = ((& $ADB -s $serial shell settings get secure navigation_mode) -join "").Trim()
+if ($navMode -eq "0") { Log "Navigation gestures disabled (three-button mode, bar still hidden)." }
+else { Log "WARNING: navigation_mode is '$navMode', expected 0 - the swipe-up home gesture may still be active." }
+
 # 4. Kill any existing Windows host so we start clean -------------------------
 Get-CimInstance Win32_Process -Filter "Name='python.exe'"  | Where-Object { $_.CommandLine -like '*gboard_host*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object { $_.CommandLine -like '*gboard_host*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
