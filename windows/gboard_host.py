@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import os
+import json
 import winreg
 
 import base64
@@ -705,7 +706,56 @@ def _make_keyboard_window(hwnd):
 # clipped (DWM composites the render surface past the region) — it only killed
 # mouse hit-testing on the top, which made the window unmovable and the toggle
 # button untappable. We now just keep the window region NULL (whole window shown).
+# ── Persisted tray settings ──────────────────────────────────────────────────
+# Small JSON store next to the run marker. Autostart lives in the registry (it has
+# to, Windows reads it), but everything else the tray menu changes belongs here so
+# it survives Quit -> Start. Written atomically via os.replace so a crash mid-write
+# cannot leave a truncated file that would throw away the user's settings.
+_SETTINGS_PATH = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                              "GboardIME", "settings.json")
+
+def _settings_load():
+    try:
+        # utf-8-sig, not utf-8: Windows editors and PowerShell's Set-Content write a
+        # UTF-8 BOM, and plain utf-8 raises on it - which would silently discard the
+        # user's settings the first time anyone touched this file by hand.
+        with open(_SETTINGS_PATH, "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log(f"[settings] unreadable ({e}) - using defaults")
+        return {}
+
+def _settings_set(key, value):
+    d = _settings_load()
+    if d.get(key) == value:
+        return                      # nothing changed; skip the disk write
+    d[key] = value
+    try:
+        os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+        tmp = _SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _SETTINGS_PATH)
+        log(f"[settings] saved {key}={value!r}")
+    except Exception as e:
+        log(f"[settings] could not save {key}: {e}")
+
 _emulator_size = (380, 470)   # current (w, h) logical; compact aspect ~1080x1300
+
+# Restore the last keyboard size chosen from the tray. Bounds-checked rather than
+# trusted: a hand-edited or corrupted file must not be able to size the window to
+# something unusable, since the tray menu is inside that window.
+_saved_size = _settings_load().get("keyboard_size")
+if (isinstance(_saved_size, (list, tuple)) and len(_saved_size) == 2
+        and all(isinstance(v, int) and 200 <= v <= 2000 for v in _saved_size)):
+    _emulator_size = (int(_saved_size[0]), int(_saved_size[1]))
+    log(f"[settings] restored keyboard size {_emulator_size}")
+elif _saved_size is not None:
+    log(f"[settings] ignoring invalid saved keyboard size {_saved_size!r}")
+
 _crop_active   = False        # retained for compatibility; always False now
 
 def _apply_crop_region(hwnd):
@@ -777,10 +827,11 @@ def _dock_emulator_bottom(w=None, h=None):
     _position_emulator()
 
 def _set_size(w, h):
-    """Resize the emulator to (w, h) and re-dock to bottom-right."""
+    """Resize the emulator to (w, h), re-dock to bottom-right, and remember it."""
     global _emulator_size
     _emulator_size = (w, h)
     _position_emulator()
+    _settings_set("keyboard_size", [w, h])
 
 def _set_crop(active, frac=None):
     """No-op shim. Keyboard-only is handled by the compact AVD resolution now, so
@@ -2295,9 +2346,15 @@ def run_tray():
 
     def size_action(w, h):
         return lambda icon, item: _set_size(w, h)
+    def size_checked(w, h):
+        # Compare on width only: height is aspect-derived, and a restored value
+        # could differ by a pixel from the table without meaning a different size.
+        return lambda item: _emulator_size[0] == w
 
     size_menu = pystray.Menu(*[
-        pystray.MenuItem(label, size_action(w, h)) for (label, w, h) in _SIZES
+        pystray.MenuItem(label, size_action(w, h), checked=size_checked(w, h),
+                         radio=True)
+        for (label, w, h) in _SIZES
     ])
 
     def height_action(px):
