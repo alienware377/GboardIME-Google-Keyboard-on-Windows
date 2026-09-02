@@ -756,6 +756,25 @@ if (isinstance(_saved_size, (list, tuple)) and len(_saved_size) == 2
 elif _saved_size is not None:
     log(f"[settings] ignoring invalid saved keyboard size {_saved_size!r}")
 
+# Window position the user dragged to. None means "dock to the bottom-right", which
+# is both the default and what the Dock menu item restores.
+_manual_pos = None
+_saved_pos = _settings_load().get("window_pos")
+if (isinstance(_saved_pos, (list, tuple)) and len(_saved_pos) == 2
+        and all(isinstance(v, int) for v in _saved_pos)):
+    # Not range-checked here: _position_emulator clamps into the current work area,
+    # which is the only place that knows the monitor layout.
+    _manual_pos = (int(_saved_pos[0]), int(_saved_pos[1]))
+    log(f"[settings] restored window position {_manual_pos}")
+
+# Auto show/hide follows the focused Windows text field. Persisted so turning it off
+# stays off across Quit -> Start. _auto_mode is declared earlier (it defaults True);
+# this reassigns it once the settings file is readable.
+_saved_auto = _settings_load().get("auto_mode")
+if isinstance(_saved_auto, bool):
+    _auto_mode = _saved_auto
+    log(f"[settings] restored auto show/hide = {_auto_mode}")
+
 _crop_active   = False        # retained for compatibility; always False now
 
 def _apply_crop_region(hwnd):
@@ -782,9 +801,22 @@ def _work_area():
     sh = ctypes.windll.user32.GetSystemMetrics(1)
     return 0, 0, sw, sh
 
+def _set_manual_pos(x, y):
+    """Remember a position the user dragged the window to, so it is restored next
+    session instead of snapping back to the bottom-right corner."""
+    global _manual_pos
+    _manual_pos = (int(x), int(y))
+    _settings_set("window_pos", [int(x), int(y)])
+
+def _clear_manual_pos():
+    """Back to docked behaviour - used by the 'Dock to bottom-right' menu item."""
+    global _manual_pos
+    _manual_pos = None
+    _settings_set("window_pos", None)
+
 def _position_emulator():
-    """Place + size the emulator at the bottom-right, applying the crop band so the
-    VISIBLE part (input box + Gboard) ends at the bottom of the screen."""
+    """Size the emulator and place it: at the user's remembered position if they have
+    dragged it, otherwise docked to the bottom-right of the work area."""
     hwnd = _find_emulator_hwnd()
     if not hwnd:
         return
@@ -815,8 +847,15 @@ def _position_emulator():
         _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
                       wr - w - DOCK_MARGIN, wt + DOCK_MARGIN, w, ah_max, SWP_NOACTIVATE)
         aw, ah, _, _ = _window_geometry(hwnd)
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
-                  wr - aw - DOCK_MARGIN, wb - ah - DOCK_MARGIN, aw, ah, SWP_NOACTIVATE)
+    if _manual_pos is None:
+        x, y = wr - aw - DOCK_MARGIN, wb - ah - DOCK_MARGIN
+    else:
+        # Clamp into the work area: the saved position may be off-screen now (monitor
+        # unplugged, resolution changed), and an unreachable keyboard cannot be
+        # dragged back because its drag handles would be off-screen too.
+        x = max(wl, min(_manual_pos[0], wr - aw))
+        y = max(wt, min(_manual_pos[1], wb - ah))
+    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, aw, ah, SWP_NOACTIVATE)
     _apply_crop_region(hwnd)
 
 def _dock_emulator_bottom(w=None, h=None):
@@ -1050,12 +1089,21 @@ def _titlebar_thread():
         root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom}")
         top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
 
-    for w in (title, container):
+    def _on_drag_end(_):
+        # Remember where the user let go, so the window comes back here next session.
+        # Saved on RELEASE, not during the drag: _on_drag_move fires per mouse motion
+        # and would otherwise write the settings file dozens of times per drag.
+        h = drag["hwnd"]
+        if not h:
+            return
+        wr = _RECT()
+        if _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr)):
+            _set_manual_pos(wr.left, wr.top)
+
+    for w in (title, container, top, grip):
         w.bind("<Button-1>", _on_drag_start)
         w.bind("<B1-Motion>", _on_drag_move)
-    for w in (top, grip):
-        w.bind("<Button-1>", _on_drag_start)
-        w.bind("<B1-Motion>", _on_drag_move)
+        w.bind("<ButtonRelease-1>", _on_drag_end)
 
     # Round only the BOTTOM corners: the region starts RADIUS above the bar so the
     # top rounded corners fall above the window and are clipped, leaving the top
@@ -2327,7 +2375,9 @@ def _make_icon_image():
 
 def run_tray():
     def on_toggle(icon, item):  toggle_emulator()
-    def on_dock(icon, item):    _dock_emulator_bottom()
+    # Docking is also how you UNDO a manual drag: it forgets the remembered position,
+    # so the keyboard returns to the corner now and on every future start.
+    def on_dock(icon, item):    _clear_manual_pos(); _dock_emulator_bottom()
     def on_adb(icon, item):     setup_adb_reverse()
     def on_quit(icon, item):    icon.stop(); os._exit(0)
 
@@ -2335,6 +2385,7 @@ def run_tray():
         global _auto_mode
         _auto_mode = not _auto_mode
         print(f"[GboardHost] Auto show/hide = {_auto_mode}")
+        _settings_set("auto_mode", _auto_mode)
     def auto_checked(item):     return _auto_mode
 
     def on_boot(icon, item):
