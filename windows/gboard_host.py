@@ -723,6 +723,10 @@ def _settings_load():
             d = json.load(f)
         return d if isinstance(d, dict) else {}
     except FileNotFoundError:
+        # Logged, not silent. A missing file and a file that failed to restore look
+        # identical in the log otherwise, which made one "my size was forgotten"
+        # report much harder to explain than it needed to be.
+        log("[settings] no settings file yet - using defaults")
         return {}
     except Exception as e:
         log(f"[settings] unreadable ({e}) - using defaults")
