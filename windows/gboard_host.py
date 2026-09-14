@@ -980,7 +980,8 @@ def _titlebar_thread():
     hwnd0 = _find_emulator_hwnd()
     scale = _window_scale(hwnd0) if hwnd0 else 2.0
     BAR_H  = max(28, int(round(24 * scale)))     # thicker bottom bar
-    TOP_H  = max(14, int(round(12 * scale)))     # thinner blank top handle
+    TOP_H  = max(22, int(round(18 * scale)))     # top handle: thick enough to hold
+                                                 # its own minimize button
     FONT_PX = max(10, int(round(10 * scale)))
     RADIUS = max(8,  int(round(11 * scale)))     # rounded top-corner radius
 
@@ -1072,10 +1073,25 @@ def _titlebar_thread():
     grip = tk.Label(top, text="•••", bg=_BAR_BG, fg="#6a6a6a",
                     font=("Segoe UI", max(7, int(round(7 * scale)))))
     grip.place(relx=0.5, rely=0.5, anchor="center")
+    # Second minimize button, mirroring the bottom bar's. Placed rather than packed
+    # so it sits above the centred grip without stealing the grip's drag area.
+    top_btn = tk.Label(top, text="—", bg=_BAR_BG, fg=_BAR_FG,
+                       font=("Segoe UI", max(7, int(round(8 * scale)))),
+                       width=4)
+    top_btn.place(relx=1.0, rely=0.5, anchor="e")
+
     def _top_enter(_): top.configure(bg=_BAR_BG_HOT); grip.configure(bg=_BAR_BG_HOT)
     def _top_leave(_): top.configure(bg=_BAR_BG);     grip.configure(bg=_BAR_BG)
     top.bind("<Enter>", _top_enter)
     top.bind("<Leave>", _top_leave)
+
+    # Its own hover colours, and it must NOT inherit the bar's drag bindings -
+    # otherwise a click here would start a drag instead of minimizing.
+    def _top_btn_enter(_): top_btn.configure(bg=_BAR_BTN_HOT, fg="#ffffff")
+    def _top_btn_leave(_): top_btn.configure(bg=_BAR_BG, fg=_BAR_FG)
+    top_btn.bind("<Enter>", _top_btn_enter)
+    top_btn.bind("<Leave>", _top_btn_leave)
+    top_btn.bind("<Button-1>", _on_min_click)
 
     def _on_drag_move(_):
         h = drag["hwnd"]
