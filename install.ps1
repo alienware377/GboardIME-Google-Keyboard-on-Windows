@@ -206,7 +206,7 @@ if ($SkipEmulator) {
         # -prop qemu.hw.mainkeys=1 suppresses the software navigation bar (63px at 420dpi);
         # lock task already blocks home/recents so the bar was pure wasted height.
         $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-                   "-writable-system -no-boot-anim -no-metrics -gpu angle_indirect -memory 2048 " +
+                   "-writable-system -no-boot-anim -no-metrics -no-audio -gpu angle_indirect -memory 2048 " +
                    "-prop qemu.hw.mainkeys=1"
         # nowmpointer routes pen/touch through Qt's legacy WM_MOUSE path. Qt 6.5's
         # WM_POINTER path replays the pen's coalesced history stamped with the CURRENT

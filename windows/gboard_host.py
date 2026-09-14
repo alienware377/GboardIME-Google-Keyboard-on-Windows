@@ -242,11 +242,22 @@ def _send(*inputs):
     _SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
 def inject_unicode_char(ch):
-    s = ord(ch)
-    _send(
-        _make_ki(scan=s, flags=KEYEVENTF_UNICODE),
-        _make_ki(scan=s, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
-    )
+    """Type one character, including emoji and other characters above U+FFFF.
+
+    wScan is 16 bits, so a code point past U+FFFF (every emoji, and CJK extensions)
+    does not fit and used to be silently truncated into a different character or
+    nothing at all. Windows expects those as a UTF-16 SURROGATE PAIR: two key events
+    carrying the high and low halves. They must go in ONE SendInput call - split
+    across two calls another app's input can interleave between the halves and the
+    pair is discarded.
+    """
+    units = ch.encode("utf-16-le")
+    events = []
+    for i in range(0, len(units), 2):
+        s = units[i] | (units[i + 1] << 8)
+        events.append(_make_ki(scan=s, flags=KEYEVENTF_UNICODE))
+        events.append(_make_ki(scan=s, flags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP))
+    _send(*events)
 
 def inject_vk(vk, extended=False):
     flags = KEYEVENTF_EXTENDEDKEY if extended else 0
@@ -2336,7 +2347,8 @@ def _restart_emulator_for_height(px):
         #    task already blocks home/recents so it was pure wasted height.
         args = [_EMULATOR_EXE, "-avd", _AVD_NAME,
                 "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
-                "-no-boot-anim", "-no-metrics", "-gpu", "angle_indirect", "-memory", "2048",
+                "-no-boot-anim", "-no-metrics", "-no-audio",
+                "-gpu", "angle_indirect", "-memory", "2048",
                 "-prop", "qemu.hw.mainkeys=1"]
         #    QT_QPA_PLATFORM=windows:nowmpointer routes pen/touch through Qt's legacy
         #    WM_MOUSE path. Qt 6.5's WM_POINTER path replays the pen's coalesced history
