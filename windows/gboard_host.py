@@ -642,11 +642,42 @@ def _hide_emulator_toolbar(main_hwnd=None):
 
     ctypes.windll.user32.EnumWindows(WNDENUMPROC(_cb), 0)
 
+# Pen gestures that Windows performs ITSELF before the app sees the input. With a
+# tablet pen, holding still on a key triggers "press and hold = right-click" (the
+# ring animation), so Gboard got a right-click instead of a long press and its
+# accent/symbol popup never opened. Fingers and mice have no such gesture, which is
+# why only the pen was affected. Flicks are off too: a fast glide stroke can be read
+# as a navigation flick.
+# This is a per-window PROPERTY, read by DefWindowProc when the pen service asks the
+# window which gestures it wants (WM_TABLET_QUERYSYSTEMGESTURESTATUS). No hook, no
+# input interception, no system-wide setting - other apps keep press-and-hold.
+_TABLET_PROP = "MicrosoftTabletPenServiceProperty"
+_TABLET_DISABLE_PRESSANDHOLD = 0x00000001
+_TABLET_DISABLE_FLICKS       = 0x00010000
+_TABLET_FLAGS = _TABLET_DISABLE_PRESSANDHOLD | _TABLET_DISABLE_FLICKS
+
+_SetPropW = ctypes.windll.user32.SetPropW
+_SetPropW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p]
+_SetPropW.restype = ctypes.c_bool
+_GetPropW = ctypes.windll.user32.GetPropW
+_GetPropW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+_GetPropW.restype = ctypes.c_void_p
+
+def _disable_pen_gestures(hwnd):
+    """Turn off pen press-and-hold and flicks for one window (see _TABLET_PROP)."""
+    try:
+        if (_GetPropW(hwnd, _TABLET_PROP) or 0) != _TABLET_FLAGS:
+            _SetPropW(hwnd, _TABLET_PROP, _TABLET_FLAGS)
+    except Exception:
+        pass
+
 def _stamp_noactivate(hwnd):
-    """OR WS_EX_NOACTIVATE onto a single window's exstyle."""
+    """OR WS_EX_NOACTIVATE onto a single window's exstyle, and switch off the pen
+    gestures that would otherwise eat Gboard's long press."""
     ex = _GetWindowLongPtr(hwnd, GWL_EXSTYLE)
     if not (ex & WS_EX_NOACTIVATE):
         _SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE)
+    _disable_pen_gestures(hwnd)
 
 def _stamp_children_noactivate(parent):
     """Recursively apply WS_EX_NOACTIVATE to every descendant window.
@@ -701,6 +732,7 @@ def _make_keyboard_window(hwnd):
     st &= ~(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
     st |= WS_POPUP
     _SetWindowLongPtr(hwnd, GWL_STYLE, st)
+    _disable_pen_gestures(hwnd)
     # The clickable render surface is a child window — stamp the whole tree so a
     # tap on Gboard can't activate the emulator and steal Windows focus.
     n = _stamp_children_noactivate(hwnd)
