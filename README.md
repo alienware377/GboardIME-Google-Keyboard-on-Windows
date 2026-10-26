@@ -97,7 +97,7 @@ The installer is idempotent and does everything end-to-end:
 
 - downloads the Android SDK cmdline-tools / platform-tools / emulator if missing
 - installs the `google_apis` x86_64 API-34 system image (the rootable, non-Play-Store image)
-- creates the `GboardIME_Root` AVD and patches it to 1080x1180 @ 420dpi with ANGLE rendering
+- creates the `GboardIME_Root` AVD and patches it to 1080x1180 @ 420dpi with hardware GPU rendering
 - installs the Python host dependencies and the prebuilt relay APK
 - cold-boots the emulator, sets Gboard as the default keyboard, sets the ADB reverse tunnel
 - provisions kiosk / Lock Task mode (Device Owner) so the keyboard can't be swiped away
@@ -153,13 +153,21 @@ exact order. The host sends `SYNC:` whenever the Windows focus moves to a new te
 
 ## Notes & quirks
 
-- **Smooth swipe typing needs `-gpu angle_indirect`** (what the installer and launcher set).
-  Gboard samples a glide once per frame, so a slow frame rate makes it misread the gesture and
-  emit the wrong word. Measured on this project, the native GL translator (`-gpu host`) stalled
-  on `Slow issue draw commands` for 351 of 366 frames — 95.9% jank, 48 ms median. ANGLE over
-  D3D11 gives a 17 ms median with zero missed vsync. Software rendering (SwiftShader) is worse
-  than both. The guest reports the same GL vendor string either way, so verify by measuring
-  (`adb shell dumpsys gfxinfo com.google.android.inputmethod.latin`), not by the vendor string.
+- **Smooth swipe typing needs a GPU that stays awake.** Gboard rebuilds a glide from the timing
+  of each touch point. When the emulator's frames come out late, touch points pile up and arrive
+  in clumps, and Gboard reads the wrong word. On an NVIDIA RTX 3090 Ti the card stayed parked in
+  its idle state (P8, 210 MHz) under the emulator's light load, and a third of the touch points
+  arrived clumped. **The fix:** in NVIDIA Control Panel, open *Manage 3D settings*, then
+  *Program Settings*, add
+  `%LOCALAPPDATA%\Android\Sdk\emulator\qemu\windows-x86_64\qemu-system-x86_64.exe`, and set
+  *Power management mode* to *Prefer maximum performance*. That kept the card at full clock and
+  cut clumped points from 20% to 3%. It only affects the emulator. You can watch the clock with
+  `nvidia-smi --query-gpu=pstate,clocks.gr --format=csv -lms 500` while you swipe.
+- **The emulator runs on `-gpu host`.** Emulator 36.x has no hardware ANGLE mode (its GPU modes
+  are `auto`, `host`, `software`, `lavapipe`, `swiftshader` and `swangle`). Earlier releases
+  passed `-gpu angle_indirect`, which this emulator silently ignores and runs host OpenGL anyway,
+  so that setting never did anything. Software rendering is much slower. Check which renderer is
+  really in use from the libraries the emulator has loaded, not from the GL vendor string.
 - **Glide typing with a tablet pen needs `QT_QPA_PLATFORM=windows:nowmpointer`** (also set by the
   launcher). Windows delivers pen through `WM_POINTER` but mouse through legacy messages; on the
   pointer path Qt 6.5 replays the stroke's buffered points and stamps each with the time it was
@@ -207,10 +215,12 @@ is not specific to a vendor. If pen typing ever regresses after an Android SDK u
 Qt 6.8 note under *Notes & quirks*.
 
 **Swipe typing picks the wrong words — what do I check?** Frame rate first. Gboard reconstructs
-a glide from per-frame samples, so anything that slows rendering makes it guess badly. Confirm
-the emulator is on `-gpu angle_indirect` and measure with
-`adb shell dumpsys gfxinfo com.google.android.inputmethod.latin` — you want a ~17 ms median and
-no `Slow issue draw commands`. If it only happens with a pen, see the pen note above.
+a glide from per-frame samples, so anything that slows rendering makes it guess badly. Check
+that your GPU is not parked in its idle state while you swipe (see the NVIDIA tip under
+*Notes & quirks*), and that nothing else is maxing out your CPU. You can measure frame times
+with `adb shell dumpsys gfxinfo com.google.android.inputmethod.latin`: you want a median of
+about 17 ms and a 99th percentile well under 50 ms. If it only happens with a pen, see the pen
+note above.
 
 **Does it work on Windows 10? Windows 11?** Both. Any 64-bit Windows 10/11 with virtualization
 enabled (for the Android emulator) and a working GPU.

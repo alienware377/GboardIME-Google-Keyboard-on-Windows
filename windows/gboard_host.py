@@ -2373,14 +2373,14 @@ def _restart_emulator_for_height(px):
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         time.sleep(3)
         # 2. relaunch cold with the SAME flags launch.ps1 uses (-writable-system is
-        #    required or the system Gboard overlay reverts; angle_indirect because the
-        #    native GL translator stalls on draw-command issue and lags glide typing).
+        #    required or the system Gboard overlay reverts; -gpu host because this
+        #    emulator has no hardware ANGLE mode, so host GL is what always ran).
         #    qemu.hw.mainkeys=1 suppresses the software nav bar (63px at 420dpi) - lock
         #    task already blocks home/recents so it was pure wasted height.
         args = [_EMULATOR_EXE, "-avd", _AVD_NAME,
                 "-no-snapshot-load", "-no-snapshot-save", "-writable-system",
                 "-no-boot-anim", "-no-metrics", "-no-audio",
-                "-gpu", "angle_indirect", "-memory", "2048",
+                "-gpu", "host", "-memory", "2048",
                 "-prop", "qemu.hw.mainkeys=1"]
         #    QT_QPA_PLATFORM=windows:nowmpointer routes pen/touch through Qt's legacy
         #    WM_MOUSE path. Qt 6.5's WM_POINTER path replays the pen's coalesced history

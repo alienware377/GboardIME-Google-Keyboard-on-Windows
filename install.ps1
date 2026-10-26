@@ -10,7 +10,7 @@
     3. Creates the "GboardIME_Root" AVD and patches it to 1080x1180 @ 420dpi, host GPU.
     4. Installs the Python host dependencies.
     5. Installs the relay APK (prebuilt; builds from source only if the APK is missing).
-    6. Cold-boots the emulator (-writable-system -gpu angle_indirect), sets Gboard as default
+    6. Cold-boots the emulator (-writable-system -gpu host), sets Gboard as default
        keyboard, sets the ADB reverse tunnel.
     7. Provisions kiosk / Lock Task mode (Device Owner) so the keyboard can't be swiped away.
     8. (Optional) debloats the emulator using windows/debloat_removed_packages.txt.
@@ -154,7 +154,7 @@ if (Test-Path $cfg) {
         "hw.lcd.height"           = "1180"
         "hw.lcd.density"          = "420"
         "hw.gpu.enabled"          = "yes"
-        "hw.gpu.mode"             = "angle_indirect"
+        "hw.gpu.mode"             = "host"     # emulator 36.x has no hardware ANGLE mode
         "hw.keyboard"             = "no"
         "hw.ramSize"              = "2048"
         "disk.dataPartition.size" = "6G"
@@ -206,7 +206,7 @@ if ($SkipEmulator) {
         # -prop qemu.hw.mainkeys=1 suppresses the software navigation bar (63px at 420dpi);
         # lock task already blocks home/recents so the bar was pure wasted height.
         $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-                   "-writable-system -no-boot-anim -no-metrics -no-audio -gpu angle_indirect -memory 2048 " +
+                   "-writable-system -no-boot-anim -no-metrics -no-audio -gpu host -memory 2048 " +
                    "-prop qemu.hw.mainkeys=1"
         # nowmpointer routes pen/touch through Qt's legacy WM_MOUSE path. Qt 6.5's
         # WM_POINTER path replays the pen's coalesced history stamped with the CURRENT

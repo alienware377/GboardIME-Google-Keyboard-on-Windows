@@ -46,12 +46,18 @@ if ($serial -and -not (Get-Process qemu-system-x86_64 -ErrorAction SilentlyConti
 if(-not $serial){
     Log "Starting emulator $AVD_NAME ..."
     # -no-snapshot-load forces a cold boot so the AVD's current hw.lcd resolution
-    # (1080x1180 @ 420dpi) and host-GPU mode are always applied, instead of loading
+    # (1080x1180 @ 420dpi) and GPU mode are always applied, instead of loading
     # a stale snapshot. -no-snapshot-save keeps it from persisting RAM state.
-    # -gpu angle_indirect (ANGLE/D3D11) NOT 'host': measured on an RTX 3090 Ti, the
-    # native GL translator stalled on 'issue draw commands' for 351 of 366 frames
-    # (95.9% jank, 48ms median), starving Gboard's glide sampler so swipes produced
-    # wrong words. ANGLE: 17ms median, 0 missed vsync, that stall gone entirely.
+    # -gpu host: this emulator (36.x) has no hardware ANGLE mode. Its only GPU modes are
+    # auto, host, software, lavapipe, swiftshader and swangle. An older version of this
+    # script passed 'angle_indirect', which the emulator silently ignored and ran host GL
+    # anyway (confirmed by the loaded modules: nvoglv64.dll, no ANGLE libEGL). So 'host'
+    # is simply the honest name for what always ran.
+    # If glide typing is slow or misreads words, check the GPU is not parked in its idle
+    # state while you swipe (nvidia-smi pstate). On an RTX 3090 Ti it stayed at P8/210MHz
+    # under the emulator's light load, which clumped touch points 20-30%. An NVIDIA per-app
+    # profile for qemu-system-x86_64.exe with Power management mode = Prefer maximum
+    # performance fixed it (3% clumped). That is a driver setting the user applies.
     # -writable-system is REQUIRED so the system Gboard 12.4 overlay stays in place;
     # without it the keyboard reverts to the stock preload state.
     #
@@ -65,7 +71,7 @@ if(-not $serial){
     # app area was 1080x1257 of a 1080x1320 screen). It is dead space in kiosk mode: lock
     # task already blocks home/recents, so the bar only cost height.
     $emuArgs = "-avd `"$AVD_NAME`" -no-snapshot-load -no-snapshot-save " +
-               "-writable-system -no-boot-anim -no-metrics -no-audio -gpu angle_indirect -memory 2048 " +
+               "-writable-system -no-boot-anim -no-metrics -no-audio -gpu host -memory 2048 " +
                "-prop qemu.hw.mainkeys=1"
     # QT_QPA_PLATFORM=windows:nowmpointer makes Qt handle pen/touch through the legacy
     # WM_MOUSE path instead of WM_POINTER. This is the glide-typing fix for tablet pens.
