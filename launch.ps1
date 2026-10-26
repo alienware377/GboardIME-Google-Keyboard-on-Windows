@@ -36,6 +36,13 @@ function Get-EmuSerial {
 
 # 1. Start the emulator if it isn't already running ----------------------------
 $serial = Get-EmuSerial
+# adb keeps listing a just-killed emulator as "device" for a few seconds. Trust it only
+# if the VM process really exists; otherwise a Quit followed quickly by Start skipped the
+# boot entirely and left the host running with no emulator behind it.
+if ($serial -and -not (Get-Process qemu-system-x86_64 -ErrorAction SilentlyContinue)) {
+    Log "adb still lists $serial but no emulator process exists - treating it as stopped."
+    $serial = $null
+}
 if(-not $serial){
     Log "Starting emulator $AVD_NAME ..."
     # -no-snapshot-load forces a cold boot so the AVD's current hw.lcd resolution
