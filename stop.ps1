@@ -23,17 +23,20 @@ function Log($m){
 
 # Run a native exe with a hard timeout. Uses System.Diagnostics.Process so we get a
 # real WaitForExit(ms) - PowerShell jobs are unreliable for this (nested-job issues
-# in 5.1 and slow startup). On timeout we hard-kill the process. Returns $true if
-# the exe completed in time, $false if it was killed.
+# in 5.1 and slow startup). On timeout we hard-kill the process.
+# Returns the exit code, -1 if it timed out (and was killed), -2 if it could not start.
+#
+# Do NOT use ProcessStartInfo.ArgumentList: it does not exist on Windows PowerShell 5.1,
+# which is what the Start-menu shortcut runs. An earlier version called it first, so it
+# threw on every call, and the catch below returned "success" - every command in this
+# script was silently skipped for months while the log said "ok" (including the guest
+# filesystem sync that protects Gboard's learned words). All our arguments are plain
+# tokens without quotes, so a quoted Arguments string is safe.
 function Invoke-WithTimeout($exe, $exeArgs, $timeoutMs) {
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $exe
-        foreach ($a in $exeArgs) { [void]$psi.ArgumentList.Add($a) } 2>$null
-        if (-not $psi.ArgumentList -or $psi.ArgumentList.Count -eq 0) {
-            # ArgumentList not supported on PS 5.1 - fall back to Arguments string
-            $psi.Arguments = ($exeArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
-        }
+        $psi.Arguments = ($exeArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true
@@ -41,12 +44,17 @@ function Invoke-WithTimeout($exe, $exeArgs, $timeoutMs) {
         $p = [System.Diagnostics.Process]::Start($psi)
         if (-not $p.WaitForExit($timeoutMs)) {
             try { $p.Kill() } catch {}
-            return $false
+            return -1
         }
-        return $true
+        return $p.ExitCode
     } catch {
-        return $true   # don't block shutdown if we couldn't even launch adb
+        Log "could not run ${exe}: $($_.Exception.Message)"
+        return -2   # still never blocks shutdown; just reported honestly
     }
+}
+
+function Describe($rc) {
+    switch ($rc) { 0 { 'ok' } -1 { 'TIMEOUT' } -2 { 'FAILED to start' } default { "exit code $rc" } }
 }
 
 Log "stop.ps1 starting (pid $PID)"
@@ -94,10 +102,10 @@ Log "Windows host stopped ($killed proc)."
 # 3. Best-effort: tell the relay app to stop and remove the reverse tunnel ----
 #    Wrapped with timeouts so a stuck adb can't hang us.
 if (Test-Path $ADB) {
-    $ok = Invoke-WithTimeout $ADB @('-s','emulator-5554','shell','am','force-stop','com.gboardrelay') 4000
-    Log "force-stop relay: $(if($ok){'ok'}else{'TIMEOUT'})"
-    $ok = Invoke-WithTimeout $ADB @('-s','emulator-5554','reverse','--remove-all') 3000
-    Log "reverse --remove-all: $(if($ok){'ok'}else{'TIMEOUT'})"
+    $rc = Invoke-WithTimeout $ADB @('-s','emulator-5554','shell','am','force-stop','com.gboardrelay') 4000
+    Log "force-stop relay: $(Describe $rc)"
+    $rc = Invoke-WithTimeout $ADB @('-s','emulator-5554','reverse','--remove-all') 3000
+    Log "reverse --remove-all: $(Describe $rc)"
 
     # Flush the GUEST page cache before the VM is killed, or Gboard's learned words
     # are lost. Gboard writes its user-history dictionary rarely and we kill
@@ -106,11 +114,18 @@ if (Test-Path $ADB) {
     # inside Android but the block never lands in the disk image. That reads to the
     # user as "my learned words keep resetting".
     # Timeout-wrapped like everything else here: Quit must never hang.
-    $ok = Invoke-WithTimeout $ADB @('-s','emulator-5554','shell','sync') 8000
-    Log "sync guest filesystem: $(if($ok){'ok'}else{'TIMEOUT'})"
+    $rc = Invoke-WithTimeout $ADB @('-s','emulator-5554','shell','sync') 8000
+    Log "sync guest filesystem: $(Describe $rc)"
 } else {
     Log "ADB not found at $ADB - skipping adb cleanup."
 }
+
+# 3b. Release the GPU clock floor. The host locks the GPU's minimum clock while the
+#     keyboard is showing (optional NVIDIA boost tasks), and it was just killed above,
+#     so it cannot release it itself. schtasks /run returns immediately; the task only
+#     exists if the user opted in, otherwise this silently does nothing.
+$rc = Invoke-WithTimeout "schtasks.exe" @('/run','/tn','\GboardIME\GPU Release') 4000
+Log "GPU clock release: $(if ($rc -eq 1) { 'not installed (skipped)' } else { Describe $rc })"
 
 # 4. Kill the emulator BY PID - reliable, never hangs. The old 'adb emu kill'
 #    sent a telnet console command which would block forever if the emulator was
