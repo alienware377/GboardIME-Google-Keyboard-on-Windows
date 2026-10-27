@@ -23,6 +23,7 @@
       -SkipDebloat     leave all stock apps installed
       -SkipKiosk       don't lock the keyboard to the foreground
       -SkipEmulator    only build/install host bits, don't boot or provision
+      -SkipGpuBoost    don't offer the NVIDIA smart GPU boost (setup-gpu-boost.ps1)
 
   NOTE: this file is intentionally ASCII-only so Windows PowerShell 5.1 parses it
   correctly regardless of file encoding. Do not add box-drawing or smart-quote chars.
@@ -30,7 +31,8 @@
 param(
     [switch]$SkipDebloat,
     [switch]$SkipKiosk,
-    [switch]$SkipEmulator
+    [switch]$SkipEmulator,
+    [switch]$SkipGpuBoost
 )
 
 $ErrorActionPreference = "Stop"
@@ -282,6 +284,20 @@ if ($SkipEmulator) {
         Run-Native $ADB "-s $serial shell am force-stop com.gboardrelay" | Out-Null
         Run-Native $ADB "-s $serial shell am start -n com.gboardrelay/.MainActivity" | Out-Null
     } else { Warn "Skipping kiosk (-SkipKiosk)" }
+}
+
+# 8b. Smart GPU boost (NVIDIA only, optional). Keeps glide typing smooth by raising the
+# GPU's minimum clock only while the keyboard is on screen. Needs admin once, so
+# Windows shows its own permission prompt; declining just skips it. See
+# setup-gpu-boost.ps1 for the measurements and what the two tasks do.
+if (-not $SkipGpuBoost -and (Test-Path "C:\Windows\System32\nvidia-smi.exe")) {
+    Step "Smart GPU boost (NVIDIA)"
+    Info "Raises the GPU clock only while the keyboard is showing, so swipe typing stays smooth"
+    Info "without holding your graphics card at full power all the time."
+    Info "Windows will ask for admin permission once. Click No to skip."
+    & powershell -NoProfile -ExecutionPolicy Bypass -File "$ROOT\setup-gpu-boost.ps1"
+    if ($LASTEXITCODE -eq 0) { Ok "GPU boost set up" }
+    else { Warn "GPU boost skipped. Run setup-gpu-boost.ps1 later to add it." }
 }
 
 # 9. Start-menu shortcuts

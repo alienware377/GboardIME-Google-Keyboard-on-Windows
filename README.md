@@ -67,6 +67,7 @@ behave exactly as they do on a phone.
 | `setup.ps1` | One-time bootstrap: SDK tools, system image, AVD, Python deps, builds the APK. |
 | `launch.ps1` | Starts (or reuses) the emulator, sets the ADB reverse tunnel, launches the relay app, starts the host. |
 | `stop.ps1` | Cleanly stops the host, relay, reverse tunnel, and emulator. |
+| `setup-gpu-boost.ps1` | Optional NVIDIA smart GPU boost: raises the GPU clock only while the keyboard is showing. `-Remove` undoes it. |
 
 `launch.ps1` and `stop.ps1` are wired to **Start GboardIME** / **Quit GboardIME** Start-menu
 shortcuts.
@@ -153,15 +154,21 @@ exact order. The host sends `SYNC:` whenever the Windows focus moves to a new te
 
 ## Notes & quirks
 
-- **Smooth swipe typing needs a GPU that stays awake.** Gboard rebuilds a glide from the timing
-  of each touch point. When the emulator's frames come out late, touch points pile up and arrive
-  in clumps, and Gboard reads the wrong word. On an NVIDIA RTX 3090 Ti the card stayed parked in
-  its idle state (P8, 210 MHz) under the emulator's light load, and a third of the touch points
-  arrived clumped. **The fix:** in NVIDIA Control Panel, open *Manage 3D settings*, then
-  *Program Settings*, add
-  `%LOCALAPPDATA%\Android\Sdk\emulator\qemu\windows-x86_64\qemu-system-x86_64.exe`, and set
-  *Power management mode* to *Prefer maximum performance*. That kept the card at full clock and
-  cut clumped points from 20% to 3%. It only affects the emulator. You can watch the clock with
+- **Smooth swipe typing needs a GPU that stays awake, and GboardIME handles that for you on
+  NVIDIA cards.** Gboard rebuilds a glide from the timing of each touch point. When the
+  emulator's frames come out late, touch points pile up and arrive in clumps, and Gboard reads
+  the wrong word. On an NVIDIA RTX 3090 Ti the card stayed parked in its idle state (P8,
+  210 MHz) under the emulator's light load, and about 20% of touch points arrived clumped.
+  **Smart GPU boost** (offered by the installer, NVIDIA only) raises the card's minimum clock
+  to 1500 MHz only while the keyboard is on screen, and releases it 10 seconds after you hide
+  the keyboard or when you quit. Measured: clumping drops to 3%, the same as running the card
+  flat out, at about 38 W instead of 113 W, and back to about 33 W idle when hidden.
+  It works through two scheduled tasks created once with admin approval (clock locking needs
+  admin), which only ever run `nvidia-smi --lock-gpu-clocks` and `--reset-gpu-clocks`. Set it
+  up later or remove it with `setup-gpu-boost.ps1` (add `-Remove` to undo).
+  Avoid the NVIDIA Control Panel's *Prefer maximum performance* profile for the emulator: it
+  is just as smooth but holds the card at full power the whole time the emulator runs, even
+  hidden or paused. You can watch the clock with
   `nvidia-smi --query-gpu=pstate,clocks.gr --format=csv -lms 500` while you swipe.
 - **The emulator runs on `-gpu host`.** Emulator 36.x has no hardware ANGLE mode (its GPU modes
   are `auto`, `host`, `software`, `lavapipe`, `swiftshader` and `swangle`). Earlier releases
@@ -216,8 +223,8 @@ Qt 6.8 note under *Notes & quirks*.
 
 **Swipe typing picks the wrong words — what do I check?** Frame rate first. Gboard reconstructs
 a glide from per-frame samples, so anything that slows rendering makes it guess badly. Check
-that your GPU is not parked in its idle state while you swipe (see the NVIDIA tip under
-*Notes & quirks*), and that nothing else is maxing out your CPU. You can measure frame times
+that your GPU is not parked in its idle state while you swipe (on NVIDIA, make sure smart GPU
+boost is set up, see *Notes & quirks*), and that nothing else is maxing out your CPU. You can measure frame times
 with `adb shell dumpsys gfxinfo com.google.android.inputmethod.latin`: you want a median of
 about 17 ms and a 99th percentile well under 50 ms. If it only happens with a pen, see the pen
 note above.

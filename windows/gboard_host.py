@@ -947,10 +947,82 @@ def _is_emu_shown(hwnd):
         return False
     return True
 
+# ── GPU boost while the keyboard is showing (NVIDIA only, optional) ──────────
+# Glide typing needs the emulator's frames on time: when the GPU parks in its idle
+# state (P8, 210 MHz on an RTX 3090 Ti) frames come out late, touch points reach the
+# guest clumped (about 20% arriving in the same instant) and Gboard misreads glides.
+# A per-app "Prefer maximum performance" profile fixes that but holds the card at P0
+# (~113 W) for as long as the emulator process exists, shown, hidden or even paused.
+# Instead, two scheduled tasks created once with admin approval lock the GPU's
+# minimum clock while the keyboard is visible and reset it afterwards:
+#   \GboardIME\GPU Boost   = nvidia-smi --lock-gpu-clocks=1500,2115
+#   \GboardIME\GPU Release = nvidia-smi --reset-gpu-clocks
+# Measured: 1500 MHz is as smooth as full speed (3.0% vs 3.2% clumped) at ~38 W, and
+# release returns to ~33 W within 2 s. The tasks run with highest privileges but only
+# ever execute those two fixed commands, and the host can only start them. If the
+# tasks do not exist (no NVIDIA card, or the user declined), all of this is a no-op.
+_GPU_TASK_BOOST   = r"\GboardIME\GPU Boost"
+_GPU_TASK_RELEASE = r"\GboardIME\GPU Release"
+_GPU_RELEASE_DELAY = 10.0   # seconds hidden before releasing, so hide/show doesn't flap
+_gpu = {"available": None, "boosted": None, "lock": threading.Lock()}
+
+def _gpu_tasks_available():
+    if _gpu["available"] is None:
+        try:
+            r = subprocess.run(["schtasks", "/query", "/tn", _GPU_TASK_BOOST],
+                               capture_output=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _gpu["available"] = (r.returncode == 0)
+        except Exception:
+            _gpu["available"] = False
+        log(f"[gpu] boost tasks {'found' if _gpu['available'] else 'not installed - boost disabled'}")
+    return _gpu["available"]
+
+def _gpu_set(boost):
+    """Boost or release the GPU clock floor. Cheap and idempotent."""
+    if not _gpu_tasks_available():
+        return
+    with _gpu["lock"]:
+        if _gpu["boosted"] == boost:
+            return
+        _gpu["boosted"] = boost
+    try:
+        subprocess.run(["schtasks", "/run", "/tn", _GPU_TASK_BOOST if boost else _GPU_TASK_RELEASE],
+                       capture_output=True, timeout=10,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        log(f"[gpu] {'boost' if boost else 'release'}")
+    except Exception as e:
+        log(f"[gpu] {'boost' if boost else 'release'} failed: {e}")
+
+def _gpu_boost_thread():
+    """Follow the keyboard's REAL on-screen state (covers the hotkey, auto show/hide,
+    the minimize buttons and anything else) and boost/release to match."""
+    hidden_since = None
+    hwnd, hwnd_at = None, 0.0
+    while True:
+        time.sleep(0.25)
+        try:
+            now = time.monotonic()
+            if not hwnd or now - hwnd_at > 5.0:     # EnumWindows is not free; cache it
+                hwnd, hwnd_at = _find_emulator_hwnd(), now
+            shown = bool(hwnd) and _is_emu_shown(hwnd)
+        except Exception:
+            shown = False
+        if shown:
+            hidden_since = None
+            _gpu_set(True)
+        elif hidden_since is None:
+            hidden_since = time.monotonic()
+        elif time.monotonic() - hidden_since >= _GPU_RELEASE_DELAY:
+            _gpu_set(False)
+
 def show_emulator(manual=False):
     """Raise the keyboard without stealing focus. manual=True marks it as a hotkey
     show (so physical typing won't auto-hide it)."""
     global _emulator_visible, _auto_shown, _target_hwnd
+    # Start the GPU clock ramp straight away (it takes ~0.5 s) rather than waiting for
+    # the watcher's next tick. Off-thread so the show itself is never delayed.
+    threading.Thread(target=_gpu_set, args=(True,), daemon=True).start()
     hwnd = _find_emulator_hwnd()
     if not hwnd:
         log("[auto] show: emulator window not found")
@@ -2443,7 +2515,9 @@ def run_tray():
     # so the keyboard returns to the corner now and on every future start.
     def on_dock(icon, item):    _clear_manual_pos(); _dock_emulator_bottom()
     def on_adb(icon, item):     setup_adb_reverse()
-    def on_quit(icon, item):    icon.stop(); os._exit(0)
+    def on_quit(icon, item):
+        _gpu_set(False)         # never leave the GPU clock floor locked behind us
+        icon.stop(); os._exit(0)
 
     def on_auto(icon, item):
         global _auto_mode
@@ -2545,6 +2619,10 @@ if __name__ == "__main__":
 
     # 3d. Custom dark-grey title bar overlay (drag + minimize) above the emulator
     threading.Thread(target=_titlebar_thread, daemon=True).start()
+
+    # 3e. Raise the GPU clock floor only while the keyboard is on screen (no-op
+    #     unless the optional NVIDIA boost tasks are installed).
+    threading.Thread(target=_gpu_boost_thread, daemon=True).start()
 
     # 4. Global hotkey listener
     t_hk = threading.Thread(target=hotkey_thread, daemon=True)
