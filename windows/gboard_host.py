@@ -400,6 +400,27 @@ def _target_tracker():
                 _target_hwnd = hwnd
         time.sleep(0.15)
 
+def _emu_z():
+    """Where the emulator goes when its 'always on top' is re-asserted: straight under
+    the extra key overlays that sit on top of it, or plain HWND_TOPMOST when none show.
+    Using HWND_TOPMOST every time briefly put the emulator over the top row and the
+    editor button (every second, and on every drag step): they flashed."""
+    if extras is not None:
+        try:
+            a = extras.z_anchor()
+            if a:
+                return ctypes.c_void_p(a)
+        except Exception:
+            pass
+    return ctypes.c_void_p(HWND_TOPMOST)
+
+def _emu_setpos(hwnd, x, y, w, h, flags):
+    """SetWindowPos for the emulator, placed under the extra key rows (see _emu_z). If
+    the anchor window disappeared in the meantime, retry plainly so the move or resize
+    still happens."""
+    if not _SetWindowPos(hwnd, _emu_z(), x, y, w, h, flags):
+        _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, w, h, flags)
+
 def _keyboard_watchdog():
     """While the keyboard is visible, keep re-stamping the (lazily-recreated) Qt
     child render window with WS_EX_NOACTIVATE and re-assert topmost, so a tap on
@@ -413,12 +434,13 @@ def _keyboard_watchdog():
             continue
         _stamp_children_noactivate(hwnd)
         _hide_emulator_toolbar(hwnd)
-        _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
-                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        # That just lifted the emulator above the extra key rows that sit over its
-        # relay area; put them back on top straight away so they never flicker.
-        if extras is not None:
-            extras.raise_now()
+        if extras is not None and extras.STATE.get("visible"):
+            # Rows are showing: let the Tk thread re-pin it right after it raises them,
+            # so nothing can lift a row in between (see extras.request_repin).
+            extras.request_repin()
+        else:
+            _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         # Re-assert the crop region — Qt clears it whenever it rebuilds its surface.
         if _crop_active:
             _apply_crop_region(hwnd)
@@ -845,7 +867,7 @@ def _make_keyboard_window(hwnd):
     # Hide the emulator's separate white toolbar window (same PID).
     _hide_emulator_toolbar(hwnd)
     # Re-assert topmost z-order + apply the frame change without activating
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+    _emu_setpos(hwnd, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
     print(f"[GboardHost] Applied no-activate + topmost styles (top-level + {n} child windows)")
 
@@ -1002,7 +1024,7 @@ def _position_emulator():
     w = max(120, min(w, aw_max))
     h = max(120, min(h, ah_max))
     # First set the requested width; the emulator aspect-locks the height itself.
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
+    _emu_setpos(hwnd,
                   wr - w - DOCK_MARGIN - er, wb - h - DOCK_MARGIN - eb, w, h, SWP_NOACTIVATE)
     # Re-read the ACTUAL size Qt settled on (aspect lock may have changed the
     # height), clamp again, then dock bottom-right by that real size.
@@ -1010,7 +1032,7 @@ def _position_emulator():
     if ah > ah_max:
         # Too tall for the work area: shrink by width and let Qt re-lock the aspect.
         w = max(120, int(w * (ah_max / float(ah))))
-        _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
+        _emu_setpos(hwnd,
                       wr - w - DOCK_MARGIN - er, wt + DOCK_MARGIN + et, w, ah_max, SWP_NOACTIVATE)
         aw, ah, _, _ = _window_geometry(hwnd)
     if _manual_pos is None:
@@ -1021,7 +1043,7 @@ def _position_emulator():
         # dragged back because its drag handles would be off-screen too.
         x = max(wl + el, min(_manual_pos[0], wr - aw - er))
         y = max(wt + et, min(_manual_pos[1], wb - ah - eb))
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, aw, ah, SWP_NOACTIVATE)
+    _emu_setpos(hwnd, x, y, aw, ah, SWP_NOACTIVATE)
     _apply_crop_region(hwnd)
 
 def _dock_emulator_bottom(w=None, h=None):
@@ -1160,7 +1182,7 @@ def show_emulator(manual=False):
         ctypes.windll.user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
     else:
         ctypes.windll.user32.ShowWindow(hwnd, SW_SHOWNA)
-    _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
+    _emu_setpos(hwnd, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
     _emulator_visible = True
     _auto_shown = (not manual)
@@ -1336,12 +1358,15 @@ def _titlebar_thread():
         ny = drag["ey"] + (cy - drag["cy"])
         # Move the emulator; the sync loop reglues both handles. Move them immediately
         # too so they track the cursor without a 1-tick lag.
-        _SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(HWND_TOPMOST),
-                      nx, ny, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
+        # Position only: it is already on top, and re-raising it on every motion event
+        # covered the extra key rows sitting over it (they flashed while dragging).
+        _SetWindowPos(ctypes.c_void_p(h), None,
+                      nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
         wr = _RECT(); _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr))
         w = wr.right - wr.left
         root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom + _bottom_rows_px()}")
         top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
+
 
     def _on_drag_end(_):
         # Remember where the user let go, so the window comes back here next session.

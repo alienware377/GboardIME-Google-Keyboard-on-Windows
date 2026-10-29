@@ -254,6 +254,15 @@ if ($SkipEmulator) {
                 if ($r -match "Success") { $n++ }
             }
             Ok "$n packages removed (reversible with: adb shell pm install-existing <pkg>)"
+            # Google Play services must be DISABLED, never 'uninstalled for user 0'. After
+            # pm uninstall --user 0 the package still sits on the system image, so Gboard's
+            # Play-services check reports SERVICE_UPDATING ('maybe it is updating') and its
+            # client retries in a tight loop that grows for days: about 1000 retries a second,
+            # flooding logcat and stalling typing. Installed-but-disabled gives SERVICE_DISABLED,
+            # which Gboard accepts and stops asking. Idempotent: one adb call once it is done.
+            Run-Native $ADB "-s $serial shell pm install-existing --user 0 com.google.android.gms" | Out-Null
+            Run-Native $ADB "-s $serial shell pm disable-user --user 0 com.google.android.gms" | Out-Null
+            Ok "Google Play services disabled (kept installed so Gboard stops retrying it)"
         } else { Warn "debloat list not found; skipping" }
     } else { Warn "Skipping debloat (-SkipDebloat)" }
 

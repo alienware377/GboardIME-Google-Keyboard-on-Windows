@@ -1087,6 +1087,48 @@ def _round_window(hwnd, w, h, corner, radius):
         log(f"round corners: {ex}")
 
 
+u32.GetTopWindow.restype = ctypes.c_void_p
+u32.GetTopWindow.argtypes = [ctypes.c_void_p]
+u32.GetWindow.restype = ctypes.c_void_p
+u32.GetWindow.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+u32.IsWindowVisible.argtypes = [ctypes.c_void_p]
+
+
+def z_anchor():
+    """The overlay the emulator should sit directly UNDER: the lowest visible one in the
+    real z-order, or None when none is showing. The host places the emulator after this
+    window whenever it re-asserts 'always on top', instead of HWND_TOPMOST, which put the
+    emulator above the top row and the editor button for a moment every second (and on
+    every drag step) until raise_now() lifted them back: a visible flash. Safe to call
+    from any thread."""
+    try:
+        hs = {h for h in list(_bar_hwnds)
+              if h and u32.IsWindowVisible(ctypes.c_void_p(h))
+              and _GetWL(h, GWL_EXSTYLE) & WS_EX_TOPMOST}
+        if not hs:
+            return None
+        last, seen, n = None, 0, 0
+        h = u32.GetTopWindow(None)
+        while h and seen < len(hs) and n < 5000:
+            if h in hs:
+                last, seen = h, seen + 1
+            h = u32.GetWindow(ctypes.c_void_p(h), 2)        # GW_HWNDNEXT: top to bottom
+            n += 1
+        return last
+    except Exception:
+        return None
+
+
+_repin = threading.Event()
+
+
+def request_repin():
+    """Ask the Tk thread to put the emulator back under the overlays on its next tick.
+    Doing it from another thread raced raise_now(): an overlay lifted between choosing
+    the anchor and inserting the emulator left the emulator on top for a frame."""
+    _repin.set()
+
+
 def raise_now():
     """Put the bars back above the emulator. The host re-asserts the emulator's
     topmost position every second, which would otherwise cover the top rows that sit
@@ -1196,8 +1238,9 @@ class _Bar:
         g = (x, y, w, h)
         if g != self.geom:
             _move_now(self.win, *g)
+            if not self.geom or self.geom[2:] != g[2:]:
+                self.render_key = None
             self.geom = g
-            self.render_key = None
         elif self.shown and not _is_at(self.hwnd, *g):
             _move_now(self.win, *g)     # a move got lost: put it right
         if not self.shown:
@@ -1225,7 +1268,7 @@ class _Bar:
         if not self.geom:
             return
         toggles = tuple(bool(u32.GetKeyState(v) & 1) for v in TOGGLE_VK.values())
-        key = (self.geom, MODS.version, self.pressed, THEME.version if THEME else 0,
+        key = (self.geom[2:], MODS.version, self.pressed, THEME.version if THEME else 0,
                CONFIG.version, toggles, scale)
         if key == self.render_key:
             return
@@ -1498,13 +1541,7 @@ class _Manager:
             visible = bool(h) and API["is_emu_shown"](h)
             STATE["visible"] = visible
             if visible:
-                self.scale = API["window_scale"](h) or self.scale
-                rects, wr = self._layout(h)
-                for bar, r, corner in zip(self.bars, rects, self.corners):
-                    bar.place(*r, self.scale, corner)
-                self._editbtn_tick()
-                raise_now()
-                self._banner_tick(wr)
+                self._place_all(h)
             else:
                 for bar in self.bars:
                     bar.hide()
@@ -1515,6 +1552,20 @@ class _Manager:
         except Exception as e:
             log(f"tick: {e}")
         self.root.after(50, self._tick)
+
+    def _place_all(self, h):
+        self.scale = API["window_scale"](h) or self.scale
+        rects, wr = self._layout(h)
+        for bar, r, corner in zip(self.bars, rects, self.corners):
+            bar.place(*r, self.scale, corner)
+        self._editbtn_tick()
+        raise_now()
+        if _repin.is_set():
+            _repin.clear()
+            a = z_anchor()
+            u32.SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(a) if a else HWND_TOPMOST,
+                             0, 0, 0, 0, SWP)
+        self._banner_tick(wr)
 
     def _drain(self):
         while True:

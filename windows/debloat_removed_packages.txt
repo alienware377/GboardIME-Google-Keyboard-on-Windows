@@ -59,8 +59,10 @@ com.google.android.odad
 
 ## Batch C — Google Play Services family + Play Store (largest background footprint)
 com.android.vending
-com.google.android.gms
 com.google.android.gsf
+# com.google.android.gms is NOT uninstalled: install.ps1 and launch.ps1 keep it
+#   installed but DISABLED (pm disable-user). Uninstalled-for-user, Gboard sees it as
+#   "updating" and retries about 1000 times a second; disabled, it gives up quietly.
 
 ## NOT removed (protected / kept on purpose)
 # com.google.android.devicelockcontroller  -> DELETE_FAILED_INTERNAL_ERROR (protected)

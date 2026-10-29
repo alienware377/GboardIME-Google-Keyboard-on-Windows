@@ -137,6 +137,25 @@ $navMode = ((& $ADB -s $serial shell settings get secure navigation_mode) -join 
 if ($navMode -eq "0") { Log "Navigation gestures disabled (three-button mode, bar still hidden)." }
 else { Log "WARNING: navigation_mode is '$navMode', expected 0 - the swipe-up home gesture may still be active." }
 
+# 3c. Keep Google Play services DISABLED (not uninstalled) so Gboard stops retrying it.
+# Google Play services must be DISABLED, never 'uninstalled for user 0'. After
+# pm uninstall --user 0 the package still sits on the system image, so Gboard's
+# Play-services check reports SERVICE_UPDATING ('maybe it is updating') and its
+# client retries in a tight loop that grows for days: about 1000 retries a second,
+# flooding logcat and stalling typing. Installed-but-disabled gives SERVICE_DISABLED,
+# which Gboard accepts and stops asking.
+# Only repairs the broken "uninstalled for user 0" state (older installs); a setup that
+# kept Play services on purpose (install.ps1 -SkipDebloat) is left alone.
+$gmsRe   = "package:com\.google\.android\.gms(\s|$)"
+$gmsHere = ((& $ADB -s $serial shell pm list packages 2>$null) -join "`n") -match $gmsRe
+$gmsAny  = ((& $ADB -s $serial shell pm list packages -u 2>$null) -join "`n") -match $gmsRe
+if ($gmsAny -and -not $gmsHere) {
+    & $ADB -s $serial shell "pm install-existing --user 0 com.google.android.gms" 2>$null | Out-Null
+    & $ADB -s $serial shell "pm disable-user --user 0 com.google.android.gms" 2>$null | Out-Null
+    & $ADB -s $serial shell "am force-stop com.google.android.inputmethod.latin" 2>$null | Out-Null
+    Log "Google Play services set to disabled (stops Gboard's retry loop)."
+}
+
 # 4. Kill any existing Windows host so we start clean -------------------------
 Get-CimInstance Win32_Process -Filter "Name='python.exe'"  | Where-Object { $_.CommandLine -like '*gboard_host*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object { $_.CommandLine -like '*gboard_host*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
