@@ -421,6 +421,69 @@ def _emu_setpos(hwnd, x, y, w, h, flags):
     if not _SetWindowPos(hwnd, _emu_z(), x, y, w, h, flags):
         _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, w, h, flags)
 
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)      # private: own argtypes
+_k32.OpenProcess.restype = ctypes.c_void_p
+_k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+_k32.CloseHandle.argtypes = [ctypes.c_void_p]
+_k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+_k32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+_k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_k32.GetLogicalProcessorInformationEx.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                                  ctypes.POINTER(ctypes.c_uint32)]
+_PCORES = None
+_tuned = {"pid": None, "at": 0.0}
+
+def _pcore_mask():
+    """Affinity mask of the performance cores on a hybrid CPU (P + E cores), else 0."""
+    global _PCORES
+    if _PCORES is None:
+        _PCORES = 0
+        try:
+            n = ctypes.c_uint32(0)
+            _k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(n))   # 0 = cores
+            buf = ctypes.create_string_buffer(n.value)
+            if _k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(n)):
+                raw, off, by_class = buf.raw, 0, {}
+                while off + 40 <= n.value:
+                    size = int.from_bytes(raw[off + 4:off + 8], "little")
+                    eff = raw[off + 9]                                     # EfficiencyClass
+                    mask = int.from_bytes(raw[off + 32:off + 40], "little")  # group 0 mask
+                    by_class[eff] = by_class.get(eff, 0) | mask
+                    off += max(size, 1)
+                if len(by_class) > 1:
+                    _PCORES = by_class[max(by_class)]
+        except Exception as e:
+            log(f"[tune] core types unknown: {e}")
+    return _PCORES
+
+def _tune_emulator_process(hwnd):
+    """Keep the emulator quick while other apps are busy. The keyboard window never
+    takes focus, so Windows treats it as background work: Normal priority, free to be
+    put on the slow efficiency cores and power-throttled (EcoQoS). With VNyan, Unity
+    and friends running, swipes then lagged and were misread. Re-applied every 30 s,
+    so an emulator restart (height change, watchdog, relaunch) can never undo it."""
+    pid = _get_window_pid(hwnd)
+    now = time.time()
+    if not pid or (pid == _tuned["pid"] and now - _tuned["at"] < 30):
+        return
+    fresh = pid != _tuned["pid"]
+    _tuned.update(pid=pid, at=now)
+    h = _k32.OpenProcess(0x0200 | 0x0400, False, pid)   # SET_INFORMATION | QUERY_INFORMATION
+    if not h:
+        return
+    try:
+        _k32.SetPriorityClass(h, 0x8000)                   # ABOVE_NORMAL_PRIORITY_CLASS
+        state = (ctypes.c_uint32 * 3)(1, 1, 0)             # control EXECUTION_SPEED, never EcoQoS
+        _k32.SetProcessInformation(h, 4, state, 12)        # ProcessPowerThrottling
+        mask = _pcore_mask()
+        if mask:
+            _k32.SetProcessAffinityMask(h, mask)
+        if fresh:
+            log(f"[tune] emulator pid {pid}: above-normal priority, no throttling"
+                + (f", P-cores {mask:#x}" if mask else ""))
+    finally:
+        _k32.CloseHandle(h)
+
 def _keyboard_watchdog():
     """While the keyboard is visible, keep re-stamping the (lazily-recreated) Qt
     child render window with WS_EX_NOACTIVATE and re-assert topmost, so a tap on
@@ -434,6 +497,10 @@ def _keyboard_watchdog():
             continue
         _stamp_children_noactivate(hwnd)
         _hide_emulator_toolbar(hwnd)
+        try:
+            _tune_emulator_process(hwnd)
+        except Exception as e:
+            log(f"[tune] {e}")
         if extras is not None and extras.STATE.get("visible"):
             # Rows are showing: let the Tk thread re-pin it right after it raises them,
             # so nothing can lift a row in between (see extras.request_repin).
@@ -2794,6 +2861,14 @@ if __name__ == "__main__":
         log("[main] another host is already running - exiting")
         sys.exit(0)
 
+    # Troubleshooting switch: GBOARDIME_OFF=extras,focus,click,touch,gpu,watchdog starts
+    # the host with those parts left out, to find which one disturbs typing.
+    _OFF = {x.strip() for x in os.environ.get("GBOARDIME_OFF", "").split(",") if x.strip()}
+    if _OFF:
+        log(f"[main] troubleshooting: parts switched off: {sorted(_OFF)}")
+    if "extras" in _OFF:
+        extras = None
+
     # 0b. Extra key rows: hand over the host helpers before anything starts typing.
     if extras is not None:
         try:
@@ -2841,23 +2916,28 @@ if __name__ == "__main__":
     threading.Thread(target=_target_tracker, daemon=True).start()
 
     # 3b. Keep re-stamping the emulator's child render window (Qt recreates it)
-    threading.Thread(target=_keyboard_watchdog, daemon=True).start()
+    if "watchdog" not in _OFF:
+        threading.Thread(target=_keyboard_watchdog, daemon=True).start()
 
     # 3c. Auto show/hide: UIA focus watcher + physical-typing hook
-    threading.Thread(target=_focus_watcher, daemon=True).start()
+    if "focus" not in _OFF:
+        threading.Thread(target=_focus_watcher, daemon=True).start()
     threading.Thread(target=_kbd_hook_thread, daemon=True).start()
     # 3c-bis. Reset the relay buffer when the user repositions the Windows caret by
     # MOUSE click or a REAL-touchscreen TAP (the spacedesk virtual digitizer is
     # excluded by device name — its coords don't map to the display).
-    threading.Thread(target=_click_watch_thread, daemon=True).start()
-    threading.Thread(target=_touch_watch_thread, daemon=True).start()
+    if "click" not in _OFF:
+        threading.Thread(target=_click_watch_thread, daemon=True).start()
+    if "touch" not in _OFF:
+        threading.Thread(target=_touch_watch_thread, daemon=True).start()
 
     # 3d. Custom dark-grey title bar overlay (drag + minimize) above the emulator
     threading.Thread(target=_titlebar_thread, daemon=True).start()
 
     # 3e. Raise the GPU clock floor only while the keyboard is on screen (no-op
     #     unless the optional NVIDIA boost tasks are installed).
-    threading.Thread(target=_gpu_boost_thread, daemon=True).start()
+    if "gpu" not in _OFF:
+        threading.Thread(target=_gpu_boost_thread, daemon=True).start()
 
     # 4. Global hotkey listener
     t_hk = threading.Thread(target=hotkey_thread, daemon=True)

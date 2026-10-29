@@ -1146,6 +1146,46 @@ def raise_now():
 
 
 _RAISE_LOG = [0.0]
+u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.DWORD)]
+
+
+def z_needs(emu):
+    """One read-only, top-down walk of the z-order: (raise_overlays, repin_emulator).
+
+    Re-stacking the overlays and the emulator on every tick (20 times a second) kept
+    nudging the emulator's window: touch input inside it arrived in clumps (10 to 20
+    swipe points at the same instant after a 50 to 150 ms freeze), so glide typing
+    picked wrong words. Now nothing is re-stacked unless the order is actually wrong:
+    an overlay ended up under the emulator, the emulator lost 'always on top', or
+    another app's always-on-top window covers it."""
+    hs = set(_bar_hwnds)
+    seen, cover = set(), False
+    try:
+        er = wt.RECT()
+        u32.GetWindowRect(ctypes.c_void_p(emu), ctypes.byref(er))
+        epid, mypid = wt.DWORD(), os.getpid()
+        u32.GetWindowThreadProcessId(ctypes.c_void_p(emu), ctypes.byref(epid))
+        h, n = u32.GetTopWindow(None), 0
+        while h and h != emu and n < 3000:
+            if h in hs:
+                seen.add(h)
+            elif not cover and u32.IsWindowVisible(ctypes.c_void_p(h)) \
+                    and _GetWL(h, GWL_EXSTYLE) & WS_EX_TOPMOST:
+                r = wt.RECT()
+                u32.GetWindowRect(ctypes.c_void_p(h), ctypes.byref(r))
+                if r.left < er.right and r.right > er.left and r.top < er.bottom \
+                        and r.bottom > er.top and r.right - r.left > 0:
+                    pid = wt.DWORD()
+                    u32.GetWindowThreadProcessId(ctypes.c_void_p(h), ctypes.byref(pid))
+                    if pid.value not in (epid.value, mypid):
+                        cover = True
+            h = u32.GetWindow(ctypes.c_void_p(h), 2)
+            n += 1
+        lost_top = not (_GetWL(emu, GWL_EXSTYLE) & WS_EX_TOPMOST)
+        need_raise = bool(hs - seen)
+        return need_raise, (cover or lost_top or need_raise)
+    except Exception:
+        return True, True
 
 
 class _Bar:
@@ -1559,13 +1599,16 @@ class _Manager:
         for bar, r, corner in zip(self.bars, rects, self.corners):
             bar.place(*r, self.scale, corner)
         self._editbtn_tick()
-        raise_now()
+        self._banner_tick(wr)
+        need_raise, need_repin = z_needs(h)
+        if need_raise:
+            raise_now()
         if _repin.is_set():
             _repin.clear()
-            a = z_anchor()
-            u32.SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(a) if a else HWND_TOPMOST,
-                             0, 0, 0, 0, SWP)
-        self._banner_tick(wr)
+            if need_repin:
+                a = z_anchor()
+                u32.SetWindowPos(ctypes.c_void_p(h), ctypes.c_void_p(a) if a else HWND_TOPMOST,
+                                 0, 0, 0, 0, SWP)
 
     def _drain(self):
         while True:
