@@ -1,4 +1,4 @@
-# GboardIME Watchdog
+﻿# GboardIME Watchdog
 # --------------------------------------------------------------------------
 # Keeps the Windows host (gboard_host.py) alive. The host has twice been killed
 # collaterally by unrelated `taskkill python` / `pkill python` from OTHER tools
@@ -72,8 +72,10 @@ function Run-Adb([string]$arguments, [int]$timeoutMs) {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $p = [System.Diagnostics.Process]::Start($psi)
-        if (-not $p.WaitForExit($timeoutMs)) { try { $p.Kill() } catch {}; return $false }
-        return $true
+        if (-not $p.WaitForExit($timeoutMs)) { try { $p.Kill() } catch {}; $p.Dispose(); return $false }
+        $ok = ($p.ExitCode -eq 0)    # a failed adb (e.g. "device offline") is not success
+        $p.Dispose()
+        return $ok
     } catch { return $false }
 }
 
@@ -92,9 +94,11 @@ function Tunnel-Present {
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
         $p = [System.Diagnostics.Process]::Start($psi)
-        if (-not $p.WaitForExit($ADB_TIMEOUT)) { try { $p.Kill() } catch {}; return $true }
+        if (-not $p.WaitForExit($ADB_TIMEOUT)) { try { $p.Kill() } catch {}; $p.Dispose(); return $true }
         $out = $p.StandardOutput.ReadToEnd()
-        return ($out -match "tcp:$DEVICE_PORT")
+        $p.Dispose()
+        # The exact pair: a stray 9876 -> something-else mapping must not count.
+        return ($out -match "tcp:$DEVICE_PORT\s+tcp:$HOST_PORT\b")
     } catch { return $true }
 }
 
@@ -193,11 +197,12 @@ while ($true) {
 
     WLog "host not running - restarting it."
     # Re-assert the reverse tunnel (harmless if already set) and the relay app,
-    # then start the host exactly as launch.ps1 does.
-    if (Test-Path $ADB) {
-        & $ADB -s $SERIAL reverse "tcp:$DEVICE_PORT" "tcp:$HOST_PORT" 2>$null | Out-Null
-        & $ADB -s $SERIAL shell am start -n "com.gboardrelay/.MainActivity" 2>$null | Out-Null
+    # then start the host exactly as launch.ps1 does. Through Run-Adb so a wedged adb
+    # can never hang the watchdog here.
+    if (-not (Run-Adb "-s $SERIAL reverse tcp:$DEVICE_PORT tcp:$HOST_PORT" $ADB_TIMEOUT)) {
+        WLog "  adb reverse timed out/failed (the host retries it too)."
     }
+    Run-Adb "-s $SERIAL shell am start -n com.gboardrelay/.MainActivity" $ADB_TIMEOUT | Out-Null
     $pyw = Resolve-Pythonw
     if (Test-Path $pyw) {
         Start-Process $pyw -ArgumentList "`"$HOSTPY`""

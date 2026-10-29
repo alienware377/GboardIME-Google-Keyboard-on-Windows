@@ -62,6 +62,8 @@ behave exactly as they do on a phone.
 |------|------------|
 | `android/GboardRelay/` | The Android relay app (Java). Captures Gboard input and sends it over TCP. |
 | `windows/gboard_host.py` | The Windows host. Receives commands and replays them via `SendInput`; system-tray icon; draggable custom title bar docked to the emulator window. |
+| `windows/extras.py` | Extra key rows and columns around the keyboard (Ctrl, Alt, Shift, Win, Fn, arrows, F-keys, cut/copy/paste, custom shortcuts), themed to match Gboard. |
+| `windows/extras_builder.py` | The drag and drop editor for the extra keys. |
 | `windows/GboardRelay.apk` | Pre-built debug APK of the relay app. |
 | `windows/debloat_removed_packages.txt` | The ~70 packages removed from the AVD to cut background load, with restore instructions. |
 | `setup.ps1` | One-time bootstrap: SDK tools, system image, AVD, Python deps, builds the APK. |
@@ -128,6 +130,32 @@ lands in the focused Windows app.
 ```powershell
 .\stop.ps1          # or the "Quit GboardIME" Start-menu shortcut
 ```
+
+## Extra keys
+
+Add up to three rows (above or below the keyboard) and two columns (left or right) of PC keys
+that Gboard does not have:
+
+- **Modifiers:** Ctrl, Alt, PC Shift (for shortcuts, not just capitals), Win, and **Fn**, which
+  turns the number keys into F1 to F12 and the arrows into PgUp, PgDn, Home and End.
+- **Editing:** Tab, Esc, Enter, Backspace, Delete, Insert, cut, copy, paste, undo, redo, select all.
+- **Navigation:** arrows, Home, End, PgUp, PgDn. **System:** Caps Lock, Num Lock, Scroll Lock,
+  the right-click Menu key, Start, Print Screen, Pause. **Function keys:** F1 to F12.
+- **Custom keys:** any key combo (for example Ctrl+Shift+T) or a piece of text to type.
+
+Modifiers work together with Gboard's own keys: tap **Ctrl**, then **a** on Gboard, and you get
+Ctrl+A. A single tap applies to the next key only; a quick double-tap locks it until you tap it
+again. Backspace, Delete and the arrows repeat while held.
+
+**Open the editor** with the small keyboard button at the top right of the keyboard, or from
+the tray menu (**Extra keys...**). Drag keys from the list into a row or column, drag them
+around to reorder, or drag one out to remove it. A plain tap on a key in the list adds it to
+the row or column you picked last, which is easier with a finger. Hover a key to see its name.
+Changes show on the real keyboard straight away; **Save** keeps them, **Cancel** undoes them.
+
+**Look:** the rows match your current Gboard theme automatically, including picture themes
+(**Re-read Gboard theme** after you change it), or pick a solid colour or a gradient, a text
+colour, and a key size. The editor button itself can be switched off there too.
 
 ## Relay protocol (newline-delimited TCP)
 

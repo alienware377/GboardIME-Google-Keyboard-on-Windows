@@ -10,6 +10,7 @@ System tray: right-click for options
 import ctypes
 import ctypes.wintypes
 import socket
+import re
 import subprocess
 import sys
 import threading
@@ -47,6 +48,27 @@ def _enable_dpi_awareness():
         pass
 _enable_dpi_awareness()
 
+# Never let a child process's start-up failure turn into a modal popup. Windows runs a
+# new process with its parent's error mode, and pythonw starts with every hard-error
+# dialog switched on, so one failed adb start used to show "unable to start correctly
+# (0xc0000142)" and sit there, alive, until someone clicked OK. SEM_FAILCRITICALERRORS
+# makes such a child just fail with an exit code we can check and retry. GP-fault
+# reporting (SEM_NOGPFAULTERRORBOX) is left alone so real crashes still reach WER.
+def _quiet_child_errors():
+    try:
+        k = ctypes.windll.kernel32
+        k.SetErrorMode(k.GetErrorMode() | 0x0001 | 0x8000)   # FAILCRITICAL | NOOPENFILEERRORBOX
+    except Exception:
+        pass
+_quiet_child_errors()
+
+# Our own taskbar identity. Without it every window (like the extra keys editor) is
+# grouped under pythonw.exe and the taskbar shows Python's icon instead of ours.
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GboardIME.Keyboard")
+except Exception:
+    pass
+
 def _window_scale(hwnd):
     """Display scale factor (1.0 at 96 DPI, 2.0 at 200%) for the window's monitor.
     Reliable now that the process is per-monitor DPI aware."""
@@ -71,6 +93,30 @@ def log(msg):
         print(line)
     except Exception:
         pass
+
+# Extra key rows/columns (Ctrl, Alt, Tab, arrows, F-keys...) live in extras.py. If it
+# fails to load for any reason the keyboard must keep working without it.
+try:
+    import extras
+except Exception as _e:
+    extras = None
+    log(f"[extras] not loaded: {_e}")
+
+def _extras_handle(kind, arg):
+    """Let sticky modifiers (Ctrl/Alt/Shift/Win/Fn on the extra rows) apply to a key
+    typed on Gboard. Returns True if extras handled it, False to inject normally."""
+    if extras is None:
+        return False
+    try:
+        if kind == "text":
+            return extras.handle_text(arg)
+        if kind == "del":
+            return extras.handle_del(arg)
+        if kind == "key":
+            return extras.handle_key(arg)
+    except Exception as e:
+        log(f"[extras] {kind} handling failed: {e}")
+    return False
 
 # ── Windows API constants ────────────────────────────────────────────────────
 INPUT_MOUSE         = 0
@@ -369,6 +415,10 @@ def _keyboard_watchdog():
         _hide_emulator_toolbar(hwnd)
         _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), 0, 0, 0, 0,
                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        # That just lifted the emulator above the extra key rows that sit over its
+        # relay area; put them back on top straight away so they never flicker.
+        if extras is not None:
+            extras.raise_now()
         # Re-assert the crop region — Qt clears it whenever it rebuilds its surface.
         if _crop_active:
             _apply_crop_region(hwnd)
@@ -447,17 +497,21 @@ def dispatch(cmd: str):
     cmd = cmd.rstrip("\r\n")   # only strip the line terminator — keep payload spaces
     if cmd.startswith("TEXT:"):
         text = cmd[5:]
-        _inject_into_target(lambda: inject_text(text))
+        if not _extras_handle("text", text):
+            _inject_into_target(lambda: inject_text(text))
     elif cmd.startswith("DEL:"):
         try:
             n = int(cmd[4:])
-            _inject_into_target(lambda: inject_backspace(n))
+            if not _extras_handle("del", n):
+                _inject_into_target(lambda: inject_backspace(n))
         except ValueError:
             pass
     elif cmd.startswith("KEY:"):
         # Generic key spec with optional modifiers, e.g. KEY:ENTER, KEY:SHIFT+LEFT,
         # KEY:CTRL+A, KEY:CTRL+SHIFT+HOME. Backward compatible with all old KEY:* names.
         spec = cmd[4:]
+        if _extras_handle("key", spec):
+            return
         parts = spec.split("+")
         keyname = parts[-1].strip().upper()
         base = keyname.split("*")[0].strip()   # strip any '*N' repeat suffix
@@ -545,31 +599,83 @@ def server_thread():
             print("[GboardHost] Android disconnected, waiting for reconnect...")
 
 # ── ADB helpers ──────────────────────────────────────────────────────────────
+_NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_serial_cache = {"serial": None, "at": 0.0}
+
+def run_adb(*args, timeout=8, serial=True, text=True):
+    """Run one adb command hidden and bounded. Returns (rc, stdout, stderr); rc is
+    None when it timed out or could not start.
+
+    Every adb start MUST pass CREATE_NO_WINDOW. adb is a console program and pythonw
+    has no console, so without the flag Windows builds a brand-new console for each
+    call and, with "let Windows decide" as the default terminal, hands it to Windows
+    Terminal. Two of those back to back ('adb devices' then 'adb reverse') sometimes
+    lose Terminal's hand-off race, and the second adb dies in start-up with 0xc0000142
+    (about one host start in 15 before this fix)."""
+    cmd = [ADB_PATH]
+    if serial:
+        cmd += ["-s", _emulator_serial()]
+    cmd += [str(a) for a in args]
+    empty = "" if text else b""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, creationflags=_NOWIN)
+    except Exception as e:
+        return None, empty, str(e)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            p.communicate(timeout=2)   # bounded: an inherited pipe must not hang us
+        except Exception:
+            pass
+        return None, empty, "timeout"
+    if text:
+        out = out.decode("utf-8", "replace")
+        err = err.decode("utf-8", "replace")
+    return p.returncode, out, err
+
+def _rc_text(rc):
+    return "timeout" if rc is None else f"{rc & 0xFFFFFFFF:#x}"
+
 def _emulator_serial():
     """Return the emulator serial (e.g. emulator-5554); handles a physical phone
-    being connected at the same time so adb never errors with 'more than one device'."""
-    try:
-        out = subprocess.run([ADB_PATH, "devices"], capture_output=True, text=True).stdout
+    being connected at the same time so adb never errors with 'more than one device'.
+    Cached for a minute; falls back to emulator-5554, the serial launch.ps1 uses."""
+    now = time.time()
+    if _serial_cache["serial"] and now - _serial_cache["at"] < 60:
+        return _serial_cache["serial"]
+    serial = None
+    rc, out, _ = run_adb("devices", timeout=5, serial=False)
+    if rc == 0:
         for line in out.splitlines():
             if line.startswith("emulator-") and "\tdevice" in line:
-                return line.split("\t", 1)[0]
-    except Exception:
-        pass
-    return None
+                serial = line.split("\t", 1)[0]
+                break
+    _serial_cache.update(serial=serial, at=now)
+    return serial or "emulator-5554"
 
-def adb(*args, capture=False):
-    serial = _emulator_serial()
-    cmd = [ADB_PATH] + (["-s", serial] if serial else []) + list(args)
-    if capture:
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        return r.stdout.strip()
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def adb(*args, timeout=8):
+    """Run an adb command hidden; log a failure. Returns True on success."""
+    rc, out, err = run_adb(*args, timeout=timeout)
+    if rc != 0:
+        _serial_cache["serial"] = None          # re-check the device next time
+        log(f"[adb] {' '.join(map(str, args))} failed: rc={_rc_text(rc)} "
+            f"{(err or out).strip()[:160]}")
+    return rc == 0
+
+def reverse_present():
+    """Is the device:9876 -> host:9877 reverse mapping registered right now?"""
+    rc, out, _ = run_adb("reverse", "--list", timeout=5)
+    return rc == 0 and bool(re.search(rf"tcp:{DEVICE_PORT}\s+tcp:{HOST_PORT}\b", out))
 
 def setup_adb_reverse():
     """Map the emulator's :9876 (what the APK connects to) to the Windows host's
-    :9877. (9876 on Windows is taken by BlenderMCP.)"""
-    adb("reverse", f"tcp:{DEVICE_PORT}", f"tcp:{HOST_PORT}")
-    print(f"[GboardHost] ADB reverse set: emulator:{DEVICE_PORT} → host:{HOST_PORT}")
+    :9877. (9876 on Windows is taken by BlenderMCP.) Returns True once verified."""
+    ok = adb("reverse", f"tcp:{DEVICE_PORT}", f"tcp:{HOST_PORT}") and reverse_present()
+    log(f"[adb] reverse {'ok' if ok else 'FAILED'}: device:{DEVICE_PORT} -> host:{HOST_PORT}")
+    return ok
 
 # ── Emulator window management ───────────────────────────────────────────────
 _emulator_visible = None   # None = unknown; will be synced on first toggle
@@ -878,13 +984,26 @@ def _position_emulator():
     # screen height with a hardcoded 50px gap, which is smaller than the taskbar
     # on a scaled display - at 200% it is ~96px - so the window covered it.)
     wl, wt, wr, wb = _work_area()
-    aw_max, ah_max = (wr - wl) - 2 * DOCK_MARGIN, (wb - wt) - 2 * DOCK_MARGIN
+    # Everything glued around the emulator has to fit too: the top drag handle, the
+    # bottom title bar, and any extra key rows/columns. (Before the extras existed
+    # the bottom bar was left out, so a docked keyboard pushed it onto the taskbar.)
+    top_h = max(22, int(round(18 * scale)))
+    bar_h = max(28, int(round(24 * scale)))
+    el, et, er, eb = (0, 0, 0, bar_h)
+    if extras is not None:
+        try:
+            el, et, er, eb = extras.get_extents(scale, bar_h)
+        except Exception as e:
+            log(f"[extras] extents failed: {e}")
+    et += top_h
+    aw_max = (wr - wl) - 2 * DOCK_MARGIN - el - er
+    ah_max = (wb - wt) - 2 * DOCK_MARGIN - et - eb
     # Clamp so a tall AVD (or a small screen) can never exceed the usable area.
     w = max(120, min(w, aw_max))
     h = max(120, min(h, ah_max))
     # First set the requested width; the emulator aspect-locks the height itself.
     _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
-                  wr - w - DOCK_MARGIN, wb - h - DOCK_MARGIN, w, h, SWP_NOACTIVATE)
+                  wr - w - DOCK_MARGIN - er, wb - h - DOCK_MARGIN - eb, w, h, SWP_NOACTIVATE)
     # Re-read the ACTUAL size Qt settled on (aspect lock may have changed the
     # height), clamp again, then dock bottom-right by that real size.
     aw, ah, _, _ = _window_geometry(hwnd)
@@ -892,16 +1011,16 @@ def _position_emulator():
         # Too tall for the work area: shrink by width and let Qt re-lock the aspect.
         w = max(120, int(w * (ah_max / float(ah))))
         _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST),
-                      wr - w - DOCK_MARGIN, wt + DOCK_MARGIN, w, ah_max, SWP_NOACTIVATE)
+                      wr - w - DOCK_MARGIN - er, wt + DOCK_MARGIN + et, w, ah_max, SWP_NOACTIVATE)
         aw, ah, _, _ = _window_geometry(hwnd)
     if _manual_pos is None:
-        x, y = wr - aw - DOCK_MARGIN, wb - ah - DOCK_MARGIN
+        x, y = wr - aw - DOCK_MARGIN - er, wb - ah - DOCK_MARGIN - eb
     else:
         # Clamp into the work area: the saved position may be off-screen now (monitor
         # unplugged, resolution changed), and an unreachable keyboard cannot be
         # dragged back because its drag handles would be off-screen too.
-        x = max(wl, min(_manual_pos[0], wr - aw))
-        y = max(wt, min(_manual_pos[1], wb - ah))
+        x = max(wl + el, min(_manual_pos[0], wr - aw - er))
+        y = max(wt + et, min(_manual_pos[1], wb - ah - eb))
     _SetWindowPos(hwnd, ctypes.c_void_p(HWND_TOPMOST), x, y, aw, ah, SWP_NOACTIVATE)
     _apply_crop_region(hwnd)
 
@@ -1221,7 +1340,7 @@ def _titlebar_thread():
                       nx, ny, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE)
         wr = _RECT(); _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr))
         w = wr.right - wr.left
-        root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom}")
+        root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom + _bottom_rows_px()}")
         top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
 
     def _on_drag_end(_):
@@ -1248,6 +1367,16 @@ def _titlebar_thread():
                                      RADIUS * 2, RADIUS * 2)
         _SetWindowRgn(ctypes.c_void_p(hwnd), ctypes.c_void_p(rgn), True)
 
+    # Bottom key rows (extras.py) sit directly under the keyboard, so the bottom bar
+    # moves down below them.
+    def _bottom_rows_px():
+        if extras is None:
+            return 0
+        try:
+            return extras.bottom_offset(scale)
+        except Exception:
+            return 0
+
     # ── Sync loop: keep the bar glued above the emulator, mirror show/hide ──
     state = {"shown": None, "rw": 0}
     def _sync():
@@ -1256,8 +1385,16 @@ def _titlebar_thread():
             if h and _is_emu_shown(h):
                 wr = _RECT(); _GetWindowRect(ctypes.c_void_p(h), ctypes.byref(wr))
                 w = wr.right - wr.left
-                root.geometry(f"{w}x{BAR_H}+{wr.left}+{wr.bottom}")
-                top.geometry(f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
+                g = (f"{w}x{BAR_H}+{wr.left}+{wr.bottom + _bottom_rows_px()}",
+                     f"{w}x{TOP_H}+{wr.left}+{wr.top - TOP_H}")
+                if g != state.get("g"):
+                    root.geometry(g[0])
+                    top.geometry(g[1])
+                    # Apply now: Tk moves windows later, when idle, and the topmost
+                    # SetWindowPos below would make it drop the move, so the handles
+                    # stayed put after a re-dock (key size, extra key edits).
+                    root.update_idletasks()
+                    state["g"] = g
                 if state["shown"] is not True:
                     root.deiconify()
                     top.deiconify()
@@ -1281,12 +1418,20 @@ def _titlebar_thread():
                     root.withdraw()
                     top.withdraw()
                     state["shown"] = False
+                    state["g"] = None        # re-apply the spot on the next show
         except Exception as e:
             log(f"[titlebar] sync error: {e}")
         root.after(120, _sync)
 
     root.after(200, _sync)
     log("[titlebar] custom dark-grey title bar started")
+    # The extra key bars share this Tk interpreter: Tk is not thread-safe, so every
+    # window has to live in this one thread.
+    if extras is not None:
+        try:
+            extras.attach(root)
+        except Exception as e:
+            log(f"[extras] attach failed: {e}")
     try:
         root.mainloop()
     except Exception as e:
@@ -2440,9 +2585,12 @@ def _restart_emulator_for_height(px):
             log(f"[height] sync skipped: {e}")
         # 1. stop the emulator (by process, never 'adb emu kill' - that can hang)
         for name in ("qemu-system-x86_64.exe", "emulator.exe"):
-            subprocess.run(["taskkill", "/F", "/IM", name],
-                           capture_output=True,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", name],
+                               capture_output=True, timeout=10,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:
+                log(f"[height] taskkill {name}: {e}")
         time.sleep(3)
         # 2. relaunch cold with the SAME flags launch.ps1 uses (-writable-system is
         #    required or the system Gboard overlay reverts; -gpu host because this
@@ -2460,9 +2608,12 @@ def _restart_emulator_for_height(px):
         #    glide typing picks wrong words. Must be set here too, or a height change
         #    would silently relaunch the emulator without the fix.
         _emu_env = dict(os.environ, QT_QPA_PLATFORM="windows:nowmpointer")
+        #    CREATE_DEFAULT_ERROR_MODE: the emulator keeps Windows' normal error
+        #    handling instead of inheriting the host's quiet mode.
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          env=_emu_env,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                         | getattr(subprocess, "CREATE_DEFAULT_ERROR_MODE", 0))
         # 3. wait for boot, then restore the link and the relay app
         for _ in range(120):
             time.sleep(5)
@@ -2476,8 +2627,11 @@ def _restart_emulator_for_height(px):
             except Exception:
                 pass
         time.sleep(4)
-        setup_adb_reverse()
-        adb("shell", "am", "start", "-n", "com.gboardrelay/.MainActivity")
+        for _ in range(5):
+            if setup_adb_reverse():
+                break
+            time.sleep(3)
+        adb("shell", "am", "start", "-n", "com.gboardrelay/.MainActivity", timeout=15)
         time.sleep(2)
         _dock_emulator_bottom()
         log(f"[height] done - screen is now 1080x{px}")
@@ -2514,7 +2668,8 @@ def run_tray():
     # Docking is also how you UNDO a manual drag: it forgets the remembered position,
     # so the keyboard returns to the corner now and on every future start.
     def on_dock(icon, item):    _clear_manual_pos(); _dock_emulator_bottom()
-    def on_adb(icon, item):     setup_adb_reverse()
+    # Off the tray thread: a slow adb must never freeze the menu.
+    def on_adb(icon, item):     threading.Thread(target=setup_adb_reverse, daemon=True).start()
     def on_quit(icon, item):
         _gpu_set(False)         # never leave the GPU clock floor locked behind us
         icon.stop(); os._exit(0)
@@ -2567,6 +2722,8 @@ def run_tray():
             pystray.MenuItem("Start at boot",  on_boot, checked=boot_checked),
             pystray.MenuItem("Dock to bottom-right",          on_dock),
             pystray.MenuItem("Keyboard size", size_menu),
+            pystray.MenuItem("Extra keys...", lambda icon, item: extras and extras.open_builder(),
+                             enabled=lambda item: extras is not None),
             pystray.MenuItem("Screen height (restarts emulator)", height_menu),
             pystray.MenuItem("Re-apply ADB reverse",          on_adb),
             pystray.Menu.SEPARATOR,
@@ -2574,6 +2731,31 @@ def run_tray():
         ),
     )
     icon.run()
+
+_repos_lock = threading.Lock()
+_repos_pending = threading.Event()
+
+def _request_reposition():
+    """Re-dock soon, at most one at a time, always with the newest config. The extra
+    keys editor asks on every live change (dragging the key-size slider fires dozens),
+    and overlapping docks could finish out of order."""
+    _repos_pending.set()
+    if not _repos_lock.acquire(blocking=False):
+        return                                   # the running worker will pick it up
+
+    def work():
+        try:
+            while _repos_pending.is_set():
+                _repos_pending.clear()
+                try:
+                    _position_emulator()
+                except Exception as e:
+                    log(f"[extras] reposition failed: {e}")
+        finally:
+            _repos_lock.release()
+        if _repos_pending.is_set():              # asked again just as we finished
+            _request_reposition()
+    threading.Thread(target=work, daemon=True).start()
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -2587,19 +2769,47 @@ if __name__ == "__main__":
         log("[main] another host is already running - exiting")
         sys.exit(0)
 
+    # 0b. Extra key rows: hand over the host helpers before anything starts typing.
+    if extras is not None:
+        try:
+            extras.init({
+                "log": log, "settings_load": _settings_load, "settings_set": _settings_set,
+                "find_emulator_hwnd": _find_emulator_hwnd, "is_emu_shown": _is_emu_shown,
+                "window_scale": _window_scale, "work_area": _work_area,
+                "inject_into_target": _inject_into_target, "inject_text": inject_text,
+                "make_ki": _make_ki, "send": _send,
+                "KEYEVENTF_KEYUP": KEYEVENTF_KEYUP, "KEYEVENTF_EXTENDEDKEY": KEYEVENTF_EXTENDEDKEY,
+                "send_to_android": send_to_android, "adb_path": ADB_PATH,
+                "run_adb": run_adb,
+                "reposition": _request_reposition,
+            })
+        except Exception as e:
+            log(f"[extras] init failed: {e}")
+            extras = None
+
     # 1. Start TCP server
     t_srv = threading.Thread(target=server_thread, daemon=True)
     t_srv.start()
 
     # 2. Set up ADB reverse (retry in background until emulator is ready)
+    #    setup_adb_reverse() reports success, so this really retries now (it used to
+    #    fire once and return whatever happened). If the watchdog already restored the
+    #    mapping, leave it be.
     def adb_retry():
-        for _ in range(30):
-            time.sleep(3)
-            try:
-                setup_adb_reverse()
+        time.sleep(3)
+        try:
+            if reverse_present():
+                log("[adb] reverse already present")
                 return
-            except Exception:
-                pass
+        except Exception:
+            pass
+        for delay in (3, 3, 5, 10, 20, 30) + (60,) * 30:
+            try:
+                if setup_adb_reverse():
+                    return
+            except Exception as e:
+                log(f"[adb] reverse attempt error: {e}")
+            time.sleep(delay)
     threading.Thread(target=adb_retry, daemon=True).start()
 
     # 3. Target window tracker
