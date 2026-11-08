@@ -2861,7 +2861,7 @@ if __name__ == "__main__":
         log("[main] another host is already running - exiting")
         sys.exit(0)
 
-    # Troubleshooting switch: GBOARDIME_OFF=extras,focus,click,touch,gpu,watchdog starts
+    # Troubleshooting switch: GBOARDIME_OFF=extras,focus,click,touch,gpu,watchdog,local starts
     # the host with those parts left out, to find which one disturbs typing.
     _OFF = {x.strip() for x in os.environ.get("GBOARDIME_OFF", "").split(",") if x.strip()}
     if _OFF:
@@ -2938,6 +2938,22 @@ if __name__ == "__main__":
     #     unless the optional NVIDIA boost tasks are installed).
     if "gpu" not in _OFF:
         threading.Thread(target=_gpu_boost_thread, daemon=True).start()
+
+    # 3f. Machine-local add-ons: any windows/local_*.py next to this file (git-ignored,
+    #     never shipped) is imported and its start(api) called, so one install can add
+    #     its own diagnostics without changing the host everyone runs.
+    if "local" not in _OFF:
+        import glob, importlib
+        for _path in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                   "local_*.py"))):
+            _name = os.path.splitext(os.path.basename(_path))[0]
+            try:
+                importlib.import_module(_name).start({
+                    "log": log, "run_adb": run_adb, "find_emulator_hwnd": _find_emulator_hwnd,
+                    "get_window_pid": _get_window_pid})
+                log(f"[main] local add-on started: {_name}")
+            except Exception as e:
+                log(f"[main] local add-on {_name} failed: {e}")
 
     # 4. Global hotkey listener
     t_hk = threading.Thread(target=hotkey_thread, daemon=True)

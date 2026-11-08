@@ -34,3 +34,6 @@ android/**/.idea/
 # OS / editor
 Thumbs.db
 .DS_Store
+
+# Machine-local host add-ons (diagnostics for one install), never shipped
+windows/local_*.py
