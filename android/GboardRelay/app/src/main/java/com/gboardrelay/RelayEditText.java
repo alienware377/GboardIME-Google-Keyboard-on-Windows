@@ -170,6 +170,11 @@ public class RelayEditText extends EditText {
     private void clearSelectionState() {
         selAnchor = -1;
         fakeSelCaret = -1;
+        // Gboard turns Select on by itself after Select all and sends no Shift-up when
+        // you leave the editing panel. A stale Select mode turned the next swipe-
+        // backspace into "select to the start, delete" and wiped the whole line. Any
+        // typing, field change or plain arrow means the panel's Select is done.
+        selectMode = false;
         dropPendingCollapse();
     }
 
@@ -514,6 +519,7 @@ public class RelayEditText extends EditText {
     public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
         InputConnection base = super.onCreateInputConnection(outAttrs);
         if (base == null) return null;
+        selectMode = false;   // a fresh connection starts with Gboard's Select off
         return new InputConnectionWrapper(base, true) {
 
             @Override
