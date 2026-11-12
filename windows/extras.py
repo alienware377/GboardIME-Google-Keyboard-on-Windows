@@ -692,7 +692,10 @@ class _Theme:
             return False
         if not (CONFIG.get()["rows"] or CONFIG.get()["cols"]):
             return False
-        return time.time() - self.at > 600            # Gboard themes change rarely
+        # Gboard themes change rarely, and the editor has a Re-read button. Each capture is
+        # a full screenshot through adb; a 10-minute cadence was running at the exact
+        # second the adb tunnel broke half-way on 2026-11-11, so keep it rare.
+        return time.time() - self.at > 4 * 3600
 
     def capture(self, force=False):
         """force=True (the editor's Re-read button) waits for a capture that is

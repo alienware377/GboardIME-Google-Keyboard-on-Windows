@@ -661,7 +661,7 @@ def server_thread():
                 conn, addr = srv.accept()
             except Exception:
                 break
-            print(f"[GboardHost] Android connected from {addr}")
+            log(f"[link] relay connected from {addr}")
             with _client_lock:
                 _client_conn = conn
             try:
@@ -681,11 +681,20 @@ def server_thread():
                             if line.strip():
                                 dispatch(line)
             except Exception as e:
-                print(f"[GboardHost] Connection lost: {e}")
+                log(f"[link] connection lost: {e}")
             finally:
                 with _client_lock:
                     _client_conn = None
-            print("[GboardHost] Android disconnected, waiting for reconnect...")
+            log("[link] relay disconnected, waiting for it to reconnect")
+
+def _keepalive_thread():
+    """PING the relay every 5 s. The relay times out after 15 s of silence and reconnects:
+    on 2026-11-11 the adb tunnel broke half-way, the relay kept waiting on a socket that
+    only reached adbd (the host side was gone), typing stopped reaching Windows for 40
+    minutes, and an emulator thread spun at 100% on the dead stream until adbd restarted."""
+    while True:
+        time.sleep(5)
+        send_to_android("PING")
 
 # ── ADB helpers ──────────────────────────────────────────────────────────────
 _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -2890,6 +2899,7 @@ if __name__ == "__main__":
     # 1. Start TCP server
     t_srv = threading.Thread(target=server_thread, daemon=True)
     t_srv.start()
+    threading.Thread(target=_keepalive_thread, daemon=True).start()
 
     # 2. Set up ADB reverse (retry in background until emulator is ready)
     #    setup_adb_reverse() reports success, so this really retries now (it used to

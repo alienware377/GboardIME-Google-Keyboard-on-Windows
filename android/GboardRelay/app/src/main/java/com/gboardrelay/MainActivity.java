@@ -18,6 +18,7 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,12 +32,14 @@ import java.util.concurrent.Future;
  *   DEL:<n>        — send n backspaces
  *   KEY:ENTER      — send Enter
  *   KEY:TAB        — send Tab
- *   PING           — keepalive
+ *   PING           keepalive, both ways (the host sends one every 5 s)
  */
 public class MainActivity extends Activity {
 
     private static final int HOST_PORT = 9876;
     private static final String HOST_ADDR = "127.0.0.1";
+    private static final int CONNECT_TIMEOUT_MS = 5000;
+    private static final int SILENCE_TIMEOUT_MS = 15000;   // host PINGs every 5 s
 
     private RelayEditText inputField;
     private TextView statusText;
@@ -258,9 +261,15 @@ public class MainActivity extends Activity {
         ioExecutor.submit(() -> {
             while (!Thread.currentThread().isInterrupted()) {
                 setStatus("Connecting to Windows host...", false);
+                Socket s = new Socket();
                 try {
-                    Socket s = new Socket(HOST_ADDR, HOST_PORT);
+                    s.connect(new InetSocketAddress(HOST_ADDR, HOST_PORT), CONNECT_TIMEOUT_MS);
                     s.setTcpNoDelay(true);
+                    // The host sends PING every few seconds. Silence for longer than this
+                    // means the adb tunnel died half-way: our end still looks connected to
+                    // adbd while the host side is gone, so readLine would wait forever and
+                    // typing would stop reaching Windows. Time out and reconnect instead.
+                    s.setSoTimeout(SILENCE_TIMEOUT_MS);
                     activeSocket = s;
                     socketOut = new PrintWriter(s.getOutputStream(), true);
                     setStatus("Connected ✓  —  type to send to Windows", true);
@@ -283,8 +292,9 @@ public class MainActivity extends Activity {
                         }
                     }
                 } catch (Exception e) {
-                    // fall through to retry
+                    // fall through to retry (includes the silence timeout above)
                 }
+                try { s.close(); } catch (Exception ignored) {}
                 socketOut = null;
                 activeSocket = null;
                 setStatus("Disconnected — retrying...", false);
