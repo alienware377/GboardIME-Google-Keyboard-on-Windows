@@ -383,6 +383,7 @@ def inject_backspace(count=1):
 _target_hwnd: int = 0
 _target_lock  = threading.Lock()
 _last_inject_time: float = 0.0   # time of last SendInput; guards cursor-sync debounce
+_last_relay_edit: float = 0.0    # when the relay last sent TEXT/DEL/KEY (see the SYNC guard)
 
 def _is_emulator_window(hwnd: int) -> bool:
     buf = ctypes.create_unicode_buffer(512)
@@ -667,7 +668,10 @@ def _set_nav_mode(mode: str):
 
 # ── Command dispatcher ───────────────────────────────────────────────────────
 def dispatch(cmd: str):
+    global _last_relay_edit
     cmd = cmd.rstrip("\r\n")   # only strip the line terminator — keep payload spaces
+    if cmd.startswith(("TEXT:", "DEL:", "KEY:")):
+        _last_relay_edit = time.time()
     if cmd.startswith("TEXT:"):
         text = cmd[5:]
         if not _extras_handle("text", text):
@@ -2115,6 +2119,8 @@ def _find_editable_descendant(ctrl, depth=6):
 def _sync_field_to_android_thread():
     """Background thread: read the focused Windows field (text + cursor) and send
     SYNC to the Android relay app so Gboard's buffer matches the new field."""
+    global _last_sync_key
+    started = time.time()
     ctypes.windll.ole32.CoInitialize(None)
     try:
         import uiautomation as auto
@@ -2198,6 +2204,15 @@ def _sync_field_to_android_thread():
             sel_end   = max(0, min(cur[1], len(text)))
         else:
             sel_start = sel_end = len(text)   # default: cursor at end
+
+        # Reading the field takes up to a second. A word typed meanwhile (usually the
+        # first swipe right after tapping into the box) is missing from what was read,
+        # and sending it would make the relay drop that word. Skip, and let the focus
+        # watcher read again once typing pauses.
+        if _last_relay_edit >= started:
+            _last_sync_key = None
+            log("[sync] skipped: typing started while the field was being read")
+            return
 
         # 3. Send. Retry briefly so a focus change that lands during the startup
         #    connection handshake isn't silently dropped (SYNC is one-shot per field).

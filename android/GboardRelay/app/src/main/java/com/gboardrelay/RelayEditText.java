@@ -1,6 +1,7 @@
 package com.gboardrelay;
 
 import android.content.Context;
+import android.os.SystemClock;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.AttributeSet;
@@ -93,6 +94,28 @@ public class RelayEditText extends EditText {
      *  follows is BACKWARD-intent even if Gboard phrases it as an afterLength
      *  (collapse-to-START variant). Cleared by the delete that consumes it. */
     private boolean shadowGestureDelete = false;
+    /** Gboard's Select toggle is on. Gboard holds SHIFT down while it is, and the
+     *  selections it makes in that state (the |< and >| jumps) are meant for Windows
+     *  too, unlike the swipe-delete highlight. */
+    private boolean selectMode = false;
+    /** Anchor (relay offset) of a selection made in Select mode, -1 when none. Gboard
+     *  hands setSelection a normalised range, so this tells which end moved. */
+    private int selAnchor = -1;
+    /** Where the Windows caret sits (relay offset) while Gboard shows a relay-only
+     *  selection, -1 when none. Swipe-on-backspace first selects the words it will
+     *  delete; Windows never sees that, so its caret stays put. Measuring the collapse
+     *  that follows from the selection's left edge instead sent RIGHT*n before the
+     *  delete, which then removed the text in front of the caret. */
+    private int fakeSelCaret = -1;
+    /** A mirrored selection (Select mode, Select all) that Gboard just collapsed, held
+     *  back for a moment. The panel's backspace collapses the selection and THEN
+     *  deletes its length; on Windows that is one backspace over the selection.
+     *  Sending the collapse as an arrow first left only a caret there, so the delete
+     *  removed a single word instead of everything selected. -1 when none. */
+    private int pendLo = -1, pendHi = -1, pendTo = -1;
+    private final Runnable flushCollapse = this::flushPendingCollapse;
+    /** When the last TEXT/DEL/KEY went out, to spot a SYNC that was read before it. */
+    private long lastEditAt = 0;
     /** Tell the IME its editor context changed, so Gboard DISCARDS the word it is
      *  currently composing and starts fresh against the new buffer.
      *
@@ -138,9 +161,46 @@ public class RelayEditText extends EditText {
         shadowMode = false;
         winSelection = false;
         shadowFakeSel = false;
+        clearSelectionState();
         icHandled = true;
         try { setText(""); } finally { icHandled = false; }
         prevText = "";
+    }
+
+    private void clearSelectionState() {
+        selAnchor = -1;
+        fakeSelCaret = -1;
+        dropPendingCollapse();
+    }
+
+    private void dropPendingCollapse() {
+        pendLo = pendHi = pendTo = -1;
+        removeCallbacks(flushCollapse);
+    }
+
+    /** Send a held-back collapse: the arrow that collapses the Windows selection onto
+     *  the same side, then any step on from that edge. */
+    private void flushPendingCollapse() {
+        if (pendLo < 0) return;
+        int lo = pendLo, hi = pendHi, to = pendTo;
+        dropPendingCollapse();
+        boolean left = to < hi;
+        send(left ? "KEY:LEFT" : "KEY:RIGHT");
+        sendCaretMove(left ? lo : hi, to);
+    }
+
+    /** True when a delete removes exactly the selection that was just collapsed; then
+     *  one backspace has removed it on Windows. Anything else sends the collapse. */
+    private boolean pendingCollapseDeleted(int before, int after) {
+        if (pendLo < 0) return false;
+        int n = pendHi - pendLo;
+        boolean whole = (pendTo == pendHi && before == n && after == 0)
+                || (pendTo == pendLo && after == n && before == 0);
+        if (!whole) { flushPendingCollapse(); return false; }
+        dropPendingCollapse();
+        send("DEL:1");
+        Log.d(TAG, "delete over the collapsed selection -> one backspace");
+        return true;
     }
 
     /** Build the invisible word-structured padding and centre the caret. Returns the
@@ -223,6 +283,7 @@ public class RelayEditText extends EditText {
         composing = "";
         winSelection = false;
         shadowFakeSel = false;
+        clearSelectionState();
         icHandled = true;
         try { installShadowPadding(); } finally { icHandled = false; }
         prevText = getText() != null ? getText().toString() : "";
@@ -264,11 +325,20 @@ public class RelayEditText extends EditText {
         // Same rule as enterShadowBuffer: a SYNC that lands mid-word would silently
         // drop the composing prefix already relayed to Windows and duplicate it.
         boolean wasComposingSync = !composing.isEmpty();
+        // The host reads the field over the best part of a second. A word swiped in
+        // that time (typically the first one right after tapping into a box) is not in
+        // the text it read, and applying it would throw that word away here and in
+        // Gboard. Keep the buffer; the host syncs again once typing pauses.
+        if (wasComposingSync && SystemClock.uptimeMillis() - lastEditAt < 1500) {
+            Log.d(TAG, "SYNC ignored: a word is being typed");
+            return;
+        }
         if (text == null || text.isEmpty()) { enterShadowBuffer(); return; }
         composing = "";
         shadowMode = false;
         winSelection = false;
         shadowFakeSel = false;
+        clearSelectionState();
         icHandled = true;
         try {
             setText(text);
@@ -287,6 +357,7 @@ public class RelayEditText extends EditText {
      *  a mouse-click reposition in Windows. Guarded with icHandled so our
      *  setSelection override doesn't re-emit a KEY:CTRL+HOME/END. */
     public void setCursorFromHost(int selStart, int selEnd) {
+        clearSelectionState();
         icHandled = true;
         try {
             int len = getText() != null ? getText().length() : 0;
@@ -299,8 +370,39 @@ public class RelayEditText extends EditText {
     }
 
     private void send(String cmd) {
+        lastEditAt = SystemClock.uptimeMillis();
         Sender s = sender;
         if (s != null) s.send(cmd);
+    }
+
+    /** Move the Windows caret from relay offset `from` to `to`. With shadow padding the
+     *  offsets are made up, so landing on either end of the buffer means the real start
+     *  or end of the Windows text. */
+    private void sendCaretMove(int from, int to) {
+        int delta = to - from;
+        if (delta == 0) return;
+        int len = getText() != null ? getText().length() : 0;
+        if (shadowMode && to <= 0) send("KEY:CTRL+HOME");
+        else if (shadowMode && to >= len) send("KEY:CTRL+END");
+        else if (delta > 0) send("KEY:RIGHT*" + delta);
+        else send("KEY:LEFT*" + (-delta));
+    }
+
+    /** Delete relay range [a,b) on Windows, whose caret sits at relay offset `caret`. */
+    private void sendDeleteRange(int a, int b, int caret) {
+        int n = b - a;
+        if (n <= 0) return;
+        if (caret == a) { send("KEY:DELETE*" + n); return; }
+        if (caret != b) sendCaretMove(caret, b);
+        sendDel(n);
+    }
+
+    /** Delete the current relay-only selection on Windows. */
+    private void sendDeleteSelection() {
+        int a = Math.min(getSelectionStart(), getSelectionEnd());
+        int b = Math.max(getSelectionStart(), getSelectionEnd());
+        sendDeleteRange(a, b, fakeSelCaret >= 0 ? fakeSelCaret : b);
+        fakeSelCaret = -1;
     }
 
     /** Emit typed text, converting embedded newlines to KEY:ENTER. */
@@ -370,8 +472,10 @@ public class RelayEditText extends EditText {
         }
         if (delCount > 0) {
             Log.d(TAG, "external delete del=" + delCount + " add=" + addCount
-                    + " (swipe/gesture delete)");
-            sendDel(delCount);
+                    + " (swipe/gesture delete) caret=" + fakeSelCaret);
+            if (fakeSelCaret >= 0) sendDeleteRange(p, p + delCount, fakeSelCaret);
+            else sendDel(delCount);
+            fakeSelCaret = -1;
             if (addCount > 0) sendText(newT.substring(p, newLen - s));
             composing = "";   // external edit invalidates the composing baseline
         }
@@ -416,6 +520,7 @@ public class RelayEditText extends EditText {
             public boolean commitText(CharSequence text, int newCursorPosition) {
                 Log.d(TAG, "commitText(" + text + ") composing=" + composing
                         + " sel=" + selectionLen() + " winSel=" + winSelection);
+                flushPendingCollapse();
                 // Commit replaces any composing region or active selection.
                 int sel = selectionLen();
                 if (composing.length() > 0) {
@@ -442,11 +547,12 @@ public class RelayEditText extends EditText {
                     shadowFakeSel = false;
                     shadowGestureDelete = false;
                 } else {
-                    sendDel(sel);
+                    if (sel > 0) sendDeleteSelection();
                     sendText(text);
                 }
                 composing = "";
                 winSelection = false;
+                clearSelectionState();
                 icHandled = true;
                 try {
                     boolean r = super.commitText(text, newCursorPosition);
@@ -459,15 +565,17 @@ public class RelayEditText extends EditText {
             public boolean setComposingText(CharSequence text, int newCursorPosition) {
                 Log.d(TAG, "setComposingText(" + text + ") composing=" + composing
                         + " sel=" + selectionLen());
+                flushPendingCollapse();
                 // Starting to compose over a selection (e.g. retyping after a
                 // swipe-delete selection) replaces that selection first. If the
                 // selection is MIRRORED on Windows (winSelection), typing the first
                 // composing char replaces it there by itself — no deletes needed.
                 if (composing.length() == 0) {
                     int sel = selectionLen();
-                    if (sel > 0 && !winSelection && !shadowMode) { sendDel(sel); }
+                    if (sel > 0 && !winSelection && !shadowMode) { sendDeleteSelection(); }
                     winSelection = false;
                     shadowFakeSel = false;
+                    clearSelectionState();
                 }
                 replaceComposing(text.toString());
                 icHandled = true;
@@ -502,6 +610,17 @@ public class RelayEditText extends EditText {
             public boolean deleteSurroundingText(int beforeLength, int afterLength) {
                 Log.d(TAG, "deleteSurroundingText(" + beforeLength + "," + afterLength
                         + ") sel=" + selectionLen() + " shadow=" + shadowMode);
+                if (pendingCollapseDeleted(beforeLength, afterLength)) {
+                    composing = "";
+                    shadowGestureDelete = false;
+                    shadowFakeSel = false;
+                    icHandled = true;
+                    try {
+                        boolean r = super.deleteSurroundingText(beforeLength, afterLength);
+                        if (shadowMode) post(RelayEditText.this::maybeRecenterShadow);
+                        return r;
+                    } finally { icHandled = false; }
+                }
                 if (shadowMode) {
                     // The counts refer to FAKE padding spaces, not real Windows text.
                     // A single tap (1) maps 1:1 to one backspace/delete; anything
@@ -534,6 +653,7 @@ public class RelayEditText extends EditText {
                     } finally { icHandled = false; }
                 }
                 // Backspace and swipe-delete of trailing text.
+                fakeSelCaret = -1;
                 sendDel(beforeLength);
                 for (int i = 0; i < afterLength; i++) send("KEY:DELETE");
                 if (beforeLength >= composing.length()) composing = "";
@@ -547,6 +667,17 @@ public class RelayEditText extends EditText {
             public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
                 Log.d(TAG, "deleteSurroundingTextInCodePoints(" + beforeLength + ","
                         + afterLength + ") shadow=" + shadowMode);
+                if (pendingCollapseDeleted(beforeLength, afterLength)) {
+                    composing = "";
+                    shadowGestureDelete = false;
+                    shadowFakeSel = false;
+                    icHandled = true;
+                    try {
+                        boolean r = super.deleteSurroundingTextInCodePoints(beforeLength, afterLength);
+                        if (shadowMode) post(RelayEditText.this::maybeRecenterShadow);
+                        return r;
+                    } finally { icHandled = false; }
+                }
                 if (shadowMode) {
                     // Same fake-padding translation as deleteSurroundingText.
                     int caret2 = Math.max(0, getSelectionStart());
@@ -566,6 +697,7 @@ public class RelayEditText extends EditText {
                         return r;
                     } finally { icHandled = false; }
                 }
+                fakeSelCaret = -1;
                 sendDel(beforeLength);
                 for (int i = 0; i < afterLength; i++) send("KEY:DELETE");
                 composing = "";
@@ -588,18 +720,59 @@ public class RelayEditText extends EditText {
                 // swipe-the-spacebar-to-move-cursor gesture. No composing guard: Gboard
                 // routes typing-time caret advances through commit/compose (which never
                 // call this override), so a setSelection here is always a real move.
+                flushPendingCollapse();
                 int curPos = getSelectionStart();   // relay caret == Windows caret (invariant)
+                int lo0 =Math.min(getSelectionStart(), getSelectionEnd());
+                int hi0 = Math.max(getSelectionStart(), getSelectionEnd());
                 Log.d(TAG, "setSelection(" + start + "," + end + ") icHandled=" + icHandled
-                        + " from=" + curPos + " composing=" + composing);
+                        + " from=" + curPos + " composing=" + composing
+                        + " select=" + selectMode + " caret=" + fakeSelCaret);
+                if (!icHandled && start != end && selectMode) {
+                    // Select mode (|< / >| while Select is on): Windows selects too.
+                    // Gboard passes the range low-high, so the end that is not the
+                    // anchor is the one that moved.
+                    int lo = Math.min(start, end), hi = Math.max(start, end);
+                    int anchor;
+                    if (lo0 == hi0) anchor = lo0;
+                    else if (selAnchor == lo0 || selAnchor == hi0) anchor = selAnchor;
+                    else anchor = getSelectionStart();
+                    int oldFocus = (lo0 == hi0) ? lo0 : (anchor == lo0 ? hi0 : lo0);
+                    int newFocus;
+                    if (lo == anchor) newFocus = hi;
+                    else if (hi == anchor) newFocus = lo;
+                    else { anchor = lo; newFocus = hi; }
+                    if (newFocus != oldFocus) {
+                        int len = getText() != null ? getText().length() : 0;
+                        if (newFocus <= 0) send("KEY:CTRL+SHIFT+HOME");
+                        else if (newFocus >= len) send("KEY:CTRL+SHIFT+END");
+                        else if (newFocus > oldFocus) send("KEY:SHIFT+RIGHT*" + (newFocus - oldFocus));
+                        else send("KEY:SHIFT+LEFT*" + (oldFocus - newFocus));
+                    }
+                    selAnchor = anchor;
+                    fakeSelCaret = -1;
+                    winSelection = true;
+                    shadowFakeSel = false;
+                    // Anchor first, so Shift+arrows afterwards extend the moving end.
+                    return super.setSelection(anchor, newFocus);
+                }
                 if (!icHandled && start != end) {
                     // A non-collapsed setSelection is a RELAY-ONLY selection (swipe-
                     // delete highlight, drag handles) — it is NOT mirrored on Windows.
+                    // Remember where the Windows caret really is.
+                    if (fakeSelCaret < 0) {
+                        if (lo0 == hi0) fakeSelCaret = lo0;
+                        else if (winSelection && (selAnchor == lo0 || selAnchor == hi0))
+                            fakeSelCaret = selAnchor == lo0 ? hi0 : lo0;
+                        else fakeSelCaret = getSelectionEnd();
+                    }
                     winSelection = false;
+                    selAnchor = -1;
                     if (shadowMode) shadowFakeSel = true;
                 }
                 if (!icHandled && start == end) {
-                    winSelection = false;           // collapsed on both sides
                     if (shadowMode && shadowFakeSel) {
+                        winSelection = false;
+                        fakeSelCaret = -1;
                         // Collapse step of Gboard's swipe-on-backspace gesture over the
                         // FAKE padding selection. Windows never saw that selection, so
                         // forwarding this as a caret move (RIGHT*k / Ctrl+End) would
@@ -611,21 +784,26 @@ public class RelayEditText extends EditText {
                         shadowGestureDelete = true;
                         return super.setSelection(start, end);
                     }
-                    int delta = start - curPos;
-                    if (delta != 0) {
-                        int len = getText() != null ? getText().length() : 0;
-                        if (shadowMode && start <= 0) {
-                            // Shadow padding: relay offsets are fiction, so the |< / >|
-                            // jump buttons map to ABSOLUTE Windows jumps instead.
-                            send("KEY:CTRL+HOME");
-                        } else if (shadowMode && start >= len) {
-                            send("KEY:CTRL+END");
-                        } else if (delta > 0) {
-                            send("KEY:RIGHT*" + delta);
-                        } else {
-                            send("KEY:LEFT*" + (-delta));
-                        }
+                    if (fakeSelCaret >= 0) {
+                        // End of a relay-only selection. The Windows caret never left
+                        // fakeSelCaret; swipe-on-backspace collapses to one end and
+                        // deletes from there, so take the real caret to that end too.
+                        sendCaretMove(fakeSelCaret, start);
+                        fakeSelCaret = -1;
+                    } else if (winSelection && lo0 != hi0) {
+                        // Windows has this selection too (Select mode, Select all). An
+                        // arrow collapses it there, but hold it back briefly: if a
+                        // delete of the whole selection follows, that is the panel's
+                        // backspace and one real backspace does it.
+                        pendLo = lo0; pendHi = hi0; pendTo = start;
+                        postDelayed(flushCollapse, 150);
+                    } else {
+                        // Shadow padding: relay offsets are fiction, so the |< / >|
+                        // jump buttons become absolute Windows jumps (sendCaretMove).
+                        sendCaretMove(curPos, start);
                     }
+                    winSelection = false;
+                    selAnchor = -1;
                 }
                 return super.setSelection(start, end);
             }
@@ -635,14 +813,19 @@ public class RelayEditText extends EditText {
                 Log.d(TAG, "sendKeyEvent action=" + event.getAction()
                         + " code=" + event.getKeyCode() + " meta=" + event.getMetaState()
                         + " sel=" + selectionLen() + " composing=" + composing);
+                flushPendingCollapse();
                 // Forward cursor-movement / selection keys (the Gboard text-editing
                 // panel: arrows, Home/End, the "Select" toggle = Shift held). We do NOT
                 // forward text-CHANGING keys here: DEL is left to the TextWatcher safety
                 // net (single source of truth), ENTER/TAB go via Activity.dispatchKeyEvent.
                 // The base connection still applies the key so the relay field's cursor
                 // and selection mirror the Windows side (keeps Copy/Cut accurate).
+                int code = event.getKeyCode();
+                if (code == KeyEvent.KEYCODE_SHIFT_LEFT || code == KeyEvent.KEYCODE_SHIFT_RIGHT) {
+                    selectMode = event.getAction() == KeyEvent.ACTION_DOWN;
+                }
                 if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                    String name = navKeyName(event.getKeyCode());
+                    String name = navKeyName(code);
                     if (name != null) {
                         int meta = event.getMetaState();
                         String mods = "";
@@ -654,6 +837,11 @@ public class RelayEditText extends EditText {
                         // collapses both. Track it so deletes over a mirrored selection
                         // aren't double-relayed.
                         winSelection = (meta & KeyEvent.META_SHIFT_ON) != 0;
+                        if (!winSelection) clearSelectionState();
+                        else if (getSelectionStart() == getSelectionEnd()) {
+                            selAnchor = getSelectionStart();
+                            fakeSelCaret = -1;
+                        }
                     } else if (event.getKeyCode() == KeyEvent.KEYCODE_DEL) {
                         if (selectionLen() > 0 && shadowMode) {
                             // DEL over a FAKE padding selection (alternate swipe-delete
@@ -678,6 +866,7 @@ public class RelayEditText extends EditText {
                             // safety-net watcher doesn't relay it again per-char.
                             send("DEL:1");
                             winSelection = false;
+                            clearSelectionState();
                             icHandled = true;
                             try { return super.sendKeyEvent(event); }
                             finally { icHandled = false; }
@@ -701,9 +890,12 @@ public class RelayEditText extends EditText {
                 // on the base (the emulator clipboard differs from Windows') - we only
                 // forward Ctrl+V so Windows pastes its own clipboard.
                 Log.d(TAG, "performContextMenuAction(" + id + ") winSel=" + winSelection);
+                flushPendingCollapse();
                 if (id == android.R.id.selectAll) {
                     send("KEY:CTRL+A");
                     winSelection = true;   // now selected on BOTH sides
+                    selAnchor = 0;
+                    fakeSelCaret = -1;
                 } else if (id == android.R.id.copy) {
                     send("KEY:CTRL+C");
                 } else if (id == android.R.id.cut) {
@@ -713,6 +905,7 @@ public class RelayEditText extends EditText {
                     // backspaces (that double-deleted: selection + N extra chars).
                     send("KEY:CTRL+X");
                     winSelection = false;
+                    clearSelectionState();
                     icHandled = true;
                     try { return super.performContextMenuAction(id); }
                     finally { icHandled = false; }
@@ -726,11 +919,15 @@ public class RelayEditText extends EditText {
             @Override
             public boolean commitCompletion(CompletionInfo text) {
                 Log.d(TAG, "commitCompletion(" + (text != null ? text.getText() : null) + ")");
-                int del = composing.length() > 0 ? composing.length() : selectionLen();
-                if (shadowMode && composing.length() == 0) del = 0;  // fake selection
-                sendDel(del);
+                flushPendingCollapse();
+                // A mirrored selection (winSelection) is replaced by the typing itself;
+                // a fake shadow selection has nothing real under it.
+                if (composing.length() > 0) sendDel(composing.length());
+                else if (selectionLen() > 0 && !shadowMode && !winSelection) sendDeleteSelection();
                 if (text != null) sendText(text.getText());
                 composing = "";
+                winSelection = false;
+                clearSelectionState();
                 icHandled = true;
                 try { return super.commitCompletion(text); }
                 finally { icHandled = false; }
