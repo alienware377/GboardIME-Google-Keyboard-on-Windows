@@ -484,6 +484,90 @@ def _tune_emulator_process(hwnd):
     finally:
         _k32.CloseHandle(h)
 
+class _THREADENTRY32(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                ("th32ThreadID", ctypes.c_uint32), ("th32OwnerProcessID", ctypes.c_uint32),
+                ("tpBasePri", ctypes.c_long), ("tpDeltaPri", ctypes.c_long),
+                ("dwFlags", ctypes.c_uint32)]
+
+_k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+_k32.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+_k32.Thread32First.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_k32.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_k32.OpenThread.restype = ctypes.c_void_p
+_k32.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+_k32.GetThreadTimes.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 4
+
+def _thread_cpu_times(pid):
+    """{thread id: CPU seconds} for every thread of a process."""
+    out = {}
+    snap = _k32.CreateToolhelp32Snapshot(0x4, 0)            # TH32CS_SNAPTHREAD
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return out
+    try:
+        te = _THREADENTRY32()
+        te.dwSize = ctypes.sizeof(_THREADENTRY32)
+        ok = _k32.Thread32First(snap, ctypes.byref(te))
+        while ok:
+            if te.th32OwnerProcessID == pid:
+                h = _k32.OpenThread(0x0800, False, te.th32ThreadID)  # QUERY_LIMITED_INFORMATION
+                if h:
+                    t = [ctypes.c_uint64() for _ in range(4)]
+                    if _k32.GetThreadTimes(h, *[ctypes.byref(x) for x in t]):
+                        out[te.th32ThreadID] = (t[2].value + t[3].value) / 1e7
+                    _k32.CloseHandle(h)
+            ok = _k32.Thread32Next(snap, ctypes.byref(te))
+    finally:
+        _k32.CloseHandle(snap)
+    return out
+
+def _heal_adb_transport(reason):
+    """Restart adbd inside the emulator and put the tunnel back. Clears both faults seen
+    so far: a relay socket left half-open after the tunnel broke, and the emulator's
+    main loop spinning at 100% on the adb plumbing (typing crawls until this is done)."""
+    log(f"[heal] {reason}: restarting the emulator's adb service")
+    run_adb("root", timeout=30)
+    time.sleep(3)
+    run_adb("wait-for-device", timeout=30)
+    # Back to the normal (non-root) adbd. "unroot" can report a timeout while adbd is
+    # still coming back, so check the real state and retry.
+    for _ in range(3):
+        run_adb("unroot", timeout=30)
+        time.sleep(3)
+        run_adb("wait-for-device", timeout=30)
+        rc, out, _ = run_adb("shell", "id -u", timeout=10)
+        if rc == 0 and out.strip() == "2000":
+            break
+    else:
+        log("[heal] adbd may still be running as root")
+    _serial_cache["serial"] = None
+    log(f"[heal] done, reverse {'ok' if setup_adb_reverse() else 'FAILED'}")
+
+def _spin_watch_thread():
+    """Watch the emulator for one thread pinned at a full core. On 2026-11-11 its main
+    loop span at 100% on the adb plumbing twice (keyboard frames 110-150 ms instead of
+    17, emulator 140% CPU with the GPU idle) and only a restart of adbd cleared it. Sample
+    every 20 s; a thread above 85% for three samples in a row triggers the heal, at most
+    once every 10 minutes."""
+    prev, strikes, last_heal = {}, 0, 0.0
+    while True:
+        time.sleep(20)
+        try:
+            hwnd = _find_emulator_hwnd()
+            pid = _get_window_pid(hwnd) if hwnd else 0
+            if not pid:
+                prev, strikes = {}, 0
+                continue
+            cur = _thread_cpu_times(pid)
+            busiest = max((cur[t] - prev[t] for t in cur if t in prev), default=0.0) / 20.0
+            prev = cur
+            strikes = strikes + 1 if busiest > 0.85 else 0
+            if strikes >= 3 and time.time() - last_heal > 600:
+                last_heal, strikes = time.time(), 0
+                _heal_adb_transport(f"an emulator thread at {busiest * 100:.0f}% for a minute")
+        except Exception as e:
+            log(f"[heal] watch error: {e}")
+
 def _keyboard_watchdog():
     """While the keyboard is visible, keep re-stamping the (lazily-recreated) Qt
     child render window with WS_EX_NOACTIVATE and re-assert topmost, so a tap on
@@ -2870,7 +2954,7 @@ if __name__ == "__main__":
         log("[main] another host is already running - exiting")
         sys.exit(0)
 
-    # Troubleshooting switch: GBOARDIME_OFF=extras,focus,click,touch,gpu,watchdog,local starts
+    # Troubleshooting switch: GBOARDIME_OFF=extras,focus,click,touch,gpu,watchdog,local,heal starts
     # the host with those parts left out, to find which one disturbs typing.
     _OFF = {x.strip() for x in os.environ.get("GBOARDIME_OFF", "").split(",") if x.strip()}
     if _OFF:
@@ -2900,6 +2984,8 @@ if __name__ == "__main__":
     t_srv = threading.Thread(target=server_thread, daemon=True)
     t_srv.start()
     threading.Thread(target=_keepalive_thread, daemon=True).start()
+    if "heal" not in _OFF:
+        threading.Thread(target=_spin_watch_thread, daemon=True).start()
 
     # 2. Set up ADB reverse (retry in background until emulator is ready)
     #    setup_adb_reverse() reports success, so this really retries now (it used to

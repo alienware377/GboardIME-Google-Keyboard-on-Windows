@@ -608,11 +608,23 @@ KB = _KbGeom()
 
 
 def _geom_thread():
-    fails = 0
+    """Keep KB (where Gboard's keyboard starts) current with as few adb calls as possible.
+
+    Every read is a short adb shell session, and the emulator's adb plumbing has a rare
+    fault where one of those sessions leaves its main loop spinning at 100% of a core:
+    typing slows to a crawl and can stop reaching Windows until adbd restarts. Reading
+    every 2 s while the keyboard was up hit that within hours. The keyboard's height
+    almost never changes, so read it twice right after the keyboard appears, then once
+    a minute while it stays up, and not at all while it is hidden (once known)."""
+    fails, was_visible, due, settle = 0, False, 0.0, 0
     while True:
         try:
-            visible = STATE.get("visible")
-            if visible or KB.top is None:
+            now = time.time()
+            visible = bool(STATE.get("visible"))
+            if visible and not was_visible:
+                due, settle = now + 0.6, 2              # just shown: let Gboard settle first
+            was_visible = visible
+            if now >= due and (visible or KB.top is None):
                 got = KB.refresh()
                 if got is None:
                     fails = 0                          # adb answers; keyboard just hidden
@@ -624,12 +636,18 @@ def _geom_thread():
                     fails += 1
                     if fails == 3:
                         log("can't read the keyboard position from the emulator; backing off")
+                if fails:
+                    due = now + min(60.0, 5.0 * 2 ** min(fails - 1, 4))
+                elif settle > 0:
+                    settle -= 1
+                    due = now + 2.5
+                else:
+                    due = now + (60.0 if visible else 5.0)
             if visible and THEME and THEME.wants_capture():
                 THEME.capture()
         except Exception as e:
             log(f"geometry thread: {e}")
-        base = 2.0 if STATE.get("visible") else 5.0
-        time.sleep(base if fails < 3 else min(30.0, base * 2 ** min(fails - 2, 4)))
+        time.sleep(0.5)
 
 
 STATE = {"visible": False}
