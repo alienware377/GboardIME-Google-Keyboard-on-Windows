@@ -384,6 +384,7 @@ _target_hwnd: int = 0
 _target_lock  = threading.Lock()
 _last_inject_time: float = 0.0   # time of last SendInput; guards cursor-sync debounce
 _last_relay_edit: float = 0.0    # when the relay last sent TEXT/DEL/KEY (see the SYNC guard)
+_last_emu_touch: float = 0.0     # last touch contact on the emulator window (same guard)
 
 def _is_emulator_window(hwnd: int) -> bool:
     buf = ctypes.create_unicode_buffer(512)
@@ -1933,6 +1934,7 @@ def _touch_watch_impl():
         # the tap is NOT on the emulator (a real caret reposition). We also skip taps
         # from the spacedesk virtual digitizer, whose coordinates don't correspond to
         # the display — only the REAL 4K touchscreen is trusted (_TOUCH_EXCLUDE names).
+        global _last_emu_touch
         size = _wt.UINT(0)
         u.GetRawInputData(_wt.HANDLE(lparam), _RID_INPUT, None,
                           ctypes.byref(size), ctypes.sizeof(_RAWINPUTHEADER))
@@ -2012,6 +2014,8 @@ def _touch_watch_impl():
                       and rc.top - pad <= sy <= rc.bottom + pad)
         if excluded:
             return
+        if on_emu:
+            _last_emu_touch = now
         # Log the decision once per distinct tap (gap since the last touch event).
         settled = now - state.get("last_log", 0) > 0.3
         if settled:
@@ -2209,7 +2213,10 @@ def _sync_field_to_android_thread():
         # first swipe right after tapping into the box) is missing from what was read,
         # and sending it would make the relay drop that word. Skip, and let the focus
         # watcher read again once typing pauses.
-        if _last_relay_edit >= started:
+        # A swipe still in progress has sent nothing yet, so also look at touches on
+        # the emulator: the SYNC's setText restarts Gboard's input and the half-drawn
+        # word is thrown away before it ever reaches the relay.
+        if _last_relay_edit >= started or _last_emu_touch >= started - 0.3:
             _last_sync_key = None
             log("[sync] skipped: typing started while the field was being read")
             return
@@ -2523,7 +2530,7 @@ def _focus_watcher():
                     # fresh SYNC once the relay has been quiet for >1s — otherwise a
                     # field switch right after typing (or a stray re-focus mid-glide)
                     # would setText() over the buffer the user is still building.
-                    if since_inject > 1.0:
+                    if since_inject > 1.0 and now2 - _last_emu_touch > 1.0:
                         _last_sync_key = skey
                         last_cursor    = None
                         threading.Thread(
