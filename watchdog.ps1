@@ -38,15 +38,8 @@ function WLog($m){
     try { Add-Content -Path $WLOG -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
-function Resolve-Pythonw {
-    $c = Get-Command pythonw.exe -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\*\pythonw.exe","C:\Python*\pythonw.exe")) {
-        $f = Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($f) { return $f.FullName }
-    }
-    return "C:\Python314\pythonw.exe"
-}
+# Same Python lookup as launch.ps1 (saved path first, skips the Store alias stub).
+. "$ROOT\windows\find-python.ps1"
 
 function Host-Alive {
     $procs = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
@@ -203,13 +196,13 @@ while ($true) {
         WLog "  adb reverse timed out/failed (the host retries it too)."
     }
     Run-Adb "-s $SERIAL shell am start -n com.gboardrelay/.MainActivity" $ADB_TIMEOUT | Out-Null
-    $pyw = Resolve-Pythonw
-    if (Test-Path $pyw) {
+    $pyw = Get-GbPythonw
+    if ($pyw) {
         Start-Process $pyw -ArgumentList "`"$HOSTPY`""
+        WLog "host restarted."
     } else {
-        Start-Process python -ArgumentList "`"$HOSTPY`"" -WindowStyle Minimized
+        WLog "  no working Python 3 found - cannot restart the host."
     }
-    WLog "host restarted."
     $linkFails = 0
     Start-Sleep -Seconds $SETTLE_SEC   # let it bind the socket before re-checking
 }

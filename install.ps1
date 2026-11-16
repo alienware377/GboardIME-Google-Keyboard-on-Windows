@@ -95,19 +95,31 @@ if ($JAVA_HOME -and (Test-Path "$JAVA_HOME\bin\java.exe")) {
 }
 $env:ANDROID_HOME = $SDK
 
-# Python
+# Python. Each candidate is started and has to answer, so the Microsoft Store
+# "App execution alias" stub (WindowsApps\python.exe) is skipped. See
+# windows\find-python.ps1. Checked first because the keyboard cannot work
+# without it, and a long install that ends in a dead keyboard helps nobody.
+. "$ROOT\windows\find-python.ps1"
 $PY = $null
-foreach ($c in @("py","python","python3")) {
-    $g = Get-Command $c -ErrorAction SilentlyContinue
-    if ($g) { $PY = $g.Source; break }
+$pyFound = Find-GbPython
+if ($pyFound) {
+    $PY = $pyFound.Python
+    Info "Python: $PY"
+} elseif (-not $SkipEmulator) {
+    Write-Host ""
+    Write-Host "  No working Python 3 was found." -ForegroundColor Red
+    Write-Host "  GboardIME needs it for the small helper that types into Windows." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  1. Install Python 3 from https://www.python.org/downloads/windows/" -ForegroundColor Yellow
+    Write-Host "     (the normal installer is fine)." -ForegroundColor Yellow
+    Write-Host "  2. If 'python' opens the Microsoft Store instead of running, turn off the" -ForegroundColor Yellow
+    Write-Host "     python.exe and python3.exe entries in Settings > Apps >" -ForegroundColor Yellow
+    Write-Host "     Advanced app settings > App execution aliases." -ForegroundColor Yellow
+    Write-Host "  3. Run Setup again." -ForegroundColor Yellow
+    Die "Python 3 is missing or does not run."
+} else {
+    Warn "No working Python 3 found. The keyboard will not type into Windows until one is installed."
 }
-if (-not $PY) {
-    foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\*\python.exe","C:\Python*\python.exe")) {
-        $f = Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($f) { $PY = $f.FullName; break }
-    }
-}
-if ($PY) { Info "Python: $PY" } else { Warn "No Python found - install Python 3 from python.org, then re-run." }
 
 # 1. cmdline-tools
 Step "Android SDK command-line tools"
@@ -178,8 +190,21 @@ if (Test-Path $cfg) {
 # 4. Python host dependencies
 Step "Python host dependencies"
 if ($PY) {
-    Run-Native $PY "-m pip install --user --quiet pystray pillow uiautomation" | Out-Null
-    Ok "pystray, pillow, uiautomation installed"
+    $pipOut = Run-Native $PY "-m pip install --user --quiet --disable-pip-version-check pystray pillow uiautomation"
+    $pipExit = $LASTEXITCODE
+    Run-Native $PY "-c `"import pystray, PIL, uiautomation`"" | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Ok "pystray, pillow, uiautomation installed"
+        Save-GbPython $PY
+    } else {
+        if ($pipOut) { $pipOut | Select-Object -Last 15 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+        Write-Host ""
+        Write-Host "  The Python packages did not install (pip exit code $pipExit)." -ForegroundColor Red
+        Write-Host "  Without them the keyboard cannot type into Windows. Try this in a new" -ForegroundColor Red
+        Write-Host "  terminal, then run Setup again:" -ForegroundColor Red
+        Write-Host "    `"$PY`" -m pip install --user pystray pillow uiautomation" -ForegroundColor Yellow
+        Warn "Python packages missing - continuing with the rest of setup."
+    }
 } else { Warn "Skipped (no Python)" }
 
 # 5. Relay APK (prefer prebuilt; build only if missing)

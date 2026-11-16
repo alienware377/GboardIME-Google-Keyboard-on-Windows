@@ -37,3 +37,6 @@ Thumbs.db
 
 # Machine-local host add-ons (diagnostics for one install), never shipped
 windows/local_*.py
+
+# Python picked by install.ps1 (machine-local)
+windows/python-path.txt

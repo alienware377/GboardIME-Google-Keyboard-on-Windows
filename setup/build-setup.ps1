@@ -26,7 +26,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 
 $files = @(
     "install.ps1","launch.ps1","stop.ps1","watchdog.ps1","setup-gpu-boost.ps1","Install.cmd","README.md",
-    "windows\gboard_host.py","windows\extras.py","windows\extras_builder.py",
+    "windows\gboard_host.py","windows\extras.py","windows\extras_builder.py","windows\find-python.ps1",
     "windows\GboardRelay.apk","windows\debloat_removed_packages.txt",
     "assets\GboardIME.ico","assets\icon.png"
 )

@@ -11,21 +11,32 @@ $EMULATOR    = "$SDK\emulator\emulator.exe"
 $AVD_NAME    = "GboardIME_Root"
 $APK         = "$ROOT\windows\GboardRelay.apk"
 $HOSTPY      = "$ROOT\windows\gboard_host.py"
-# Resolve pythonw.exe portably: PATH first, then common install dirs, then a fallback.
-$PYTHONW = $null
-$cmd = Get-Command pythonw.exe -ErrorAction SilentlyContinue
-if ($cmd) { $PYTHONW = $cmd.Source }
-if (-not $PYTHONW) {
-    foreach ($p in @("$env:LOCALAPPDATA\Programs\Python\*\pythonw.exe","C:\Python*\pythonw.exe")) {
-        $f = Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($f) { $PYTHONW = $f.FullName; break }
-    }
-}
-if (-not $PYTHONW) { $PYTHONW = "C:\Python314\pythonw.exe" }   # last-resort default
+# pythonw.exe for the host: the one install.ps1 checked, or a fresh search that
+# skips the Microsoft Store alias stub. $null when no working Python exists.
+. "$ROOT\windows\find-python.ps1"
+$PYTHONW = Get-GbPythonw
 $DEVICE_PORT = 9876   # what the relay APK connects to inside the emulator
 $HOST_PORT   = 9877   # what the Windows host listens on (9876 is taken by Blender)
 
 function Log($m){ Write-Host "[GboardIME] $m" -ForegroundColor Green }
+
+# launch.ps1 usually runs from a hidden shortcut, so problems go in a message box.
+function Show-HostError([string]$detail) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "GboardIME's Windows helper did not start, so typing will not reach Windows.`n`n" +
+            "$detail`n`nInstall Python 3 from python.org (if 'python' opens the Microsoft Store, " +
+            "turn off the python.exe and python3.exe App execution aliases in Windows Settings), " +
+            "then run GboardIME Setup again.",
+            "GboardIME", "OK", "Warning") | Out-Null
+    } catch {}
+}
+
+function Get-HostProcs {
+    Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*gboard_host*' }
+}
 
 function Get-EmuSerial {
     foreach($l in (& $ADB devices)){
@@ -166,10 +177,23 @@ Start-Sleep -Milliseconds 500
 & $ADB -s $serial shell am start -n "com.gboardrelay/.MainActivity" | Out-Null
 
 # 6. Start the Windows host (system tray, no console window) -------------------
-if(Test-Path $PYTHONW){
-    Start-Process $PYTHONW -ArgumentList "`"$HOSTPY`""
-} else {
-    Start-Process python -ArgumentList "`"$HOSTPY`"" -WindowStyle Minimized
+if(-not $PYTHONW){
+    Log "No working Python 3 found - the Windows host cannot start."
+    Show-HostError "No working Python 3 was found on this PC."
+    exit 1
+}
+Log "Starting host with $PYTHONW"
+Start-Process $PYTHONW -ArgumentList "`"$HOSTPY`""
+# A broken Python (or missing packages) makes the host exit at once. Give it a few
+# seconds and say so, instead of leaving a bare emulator window and silence.
+$hostUp = $false
+for ($i = 1; $i -le 8; $i++) {
+    Start-Sleep 1
+    if ($i -ge 3 -and (Get-HostProcs)) { $hostUp = $true; break }
+}
+if (-not $hostUp) {
+    Log "Host did not stay running - see windows\gboard_host.log."
+    Show-HostError "Python was found at $PYTHONW but the helper exited. Python or its packages may be broken."
 }
 
 # 7. Watchdog: mark "should be running" and start the PowerShell watchdog that
